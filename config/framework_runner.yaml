@@ -1,0 +1,3 @@
+ivf_pre_screen:
+  temperature: 0.1
+  max_repair_attempts: 1

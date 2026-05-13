@@ -84,8 +84,11 @@ The NSM downloader captures debug artifacts as it works through the live FCA flo
 Keep deployment-specific values in `.env`, such as:
 
 - `DATABASE_URL`
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
+- `LLM_PROVIDER`
+- `LLM_MODEL`
+- `OPENROUTER_API_KEY`
 - `BROWSER_CHANNEL`
 
 Keep NSM site behavior and selectors in [config/nsm.yaml](C:\dev\agentic investing\config\nsm.yaml). That file is versioned with the repo because it describes how our downloader interacts with a specific source, and we want changes to those selectors and timings to be visible in git history.
+
+Keep framework-runner behavior in [config/framework_runner.yaml](C:\dev\agentic investing\config\framework_runner.yaml). That includes framework-specific knobs such as the IVF pre-screen temperature and repair policy, which are better treated as versioned application behavior than deployment secrets.

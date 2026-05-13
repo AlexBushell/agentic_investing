@@ -391,7 +391,7 @@ class NSMDownloadService:
         }
         preferred_keywords = keyword_sets.get(normalized_type, ())
 
-        def score(candidate: NSMCandidate) -> tuple[int, int, datetime]:
+        def score(candidate: NSMCandidate) -> tuple[int, int, int, datetime]:
             haystack = " ".join(
                 part for part in (candidate.title, candidate.category or "") if part
             ).lower()
@@ -411,8 +411,13 @@ class NSMDownloadService:
                 elif org_name.startswith(normalized_query):
                     org_score = 1
 
+            title_score = NSMDownloadService._candidate_title_score(
+                candidate=candidate,
+                document_type=normalized_type,
+            )
+            href_score = NSMDownloadService._candidate_href_score(candidate)
             date_key = NSMDownloadService._parse_candidate_datetime(candidate.date_text)
-            return (org_score, match_score, date_key)
+            return (org_score, title_score, href_score + match_score, date_key)
 
         return sorted(candidates, key=score, reverse=True)
 
@@ -440,14 +445,29 @@ class NSMDownloadService:
         if not preferred_keywords:
             return candidates[0] if candidates else None
 
+        best_candidate: Optional[NSMCandidate] = None
+        best_score: tuple[int, int, datetime] | None = None
+
         for candidate in candidates:
             haystack = " ".join(
                 part for part in (candidate.title, candidate.category or "") if part
             ).lower()
-            if any(keyword in haystack for keyword in preferred_keywords):
-                return candidate
+            if not any(keyword in haystack for keyword in preferred_keywords):
+                continue
 
-        return None
+            candidate_score = (
+                NSMDownloadService._candidate_title_score(
+                    candidate=candidate,
+                    document_type=normalized_type,
+                ),
+                NSMDownloadService._candidate_href_score(candidate),
+                NSMDownloadService._parse_candidate_datetime(candidate.date_text),
+            )
+            if best_score is None or candidate_score > best_score:
+                best_candidate = candidate
+                best_score = candidate_score
+
+        return best_candidate
 
     def _download_candidate(self, page, candidate: NSMCandidate, download_dir: Path) -> Path:
         href = candidate.href
@@ -610,6 +630,57 @@ class NSMDownloadService:
             "interim-report": "Interim Report",
         }
         return mapping.get(document_type.strip().lower())
+
+    @staticmethod
+    def _candidate_title_score(candidate: NSMCandidate, document_type: str) -> int:
+        haystack = " ".join(
+            part for part in (candidate.title, candidate.category or "") if part
+        ).lower()
+
+        if document_type == "annual-report":
+            phrase_scores = (
+                ("esef tagged annual report and audited accounts", 9),
+                ("esef tagged annual report", 8),
+                ("annual report and audited accounts", 7),
+                ("annual report and financial statements", 6),
+                ("annual report and accounts", 5),
+                ("annual report", 4),
+                ("annual financial report", 3),
+                ("full year results", 1),
+                ("final results", 1),
+            )
+        elif document_type == "interim-report":
+            phrase_scores = (
+                ("half-year report", 7),
+                ("half year report", 7),
+                ("interim report", 6),
+                ("half-yearly report", 6),
+                ("results", 1),
+            )
+        else:
+            phrase_scores = ()
+
+        for phrase, score in phrase_scores:
+            if phrase in haystack:
+                return score
+
+        return 0
+
+    @staticmethod
+    def _candidate_href_score(candidate: NSMCandidate) -> int:
+        href = (candidate.href or "").lower()
+        if not href:
+            # Null href often means the richer popup/download flow that yields zip/XHTML packages.
+            return 3
+        if "/rns/" in href:
+            return 0
+        if href.endswith(".pdf"):
+            return 2
+        if href.endswith(".zip") or href.endswith(".xhtml") or href.endswith(".xml"):
+            return 3
+        if href.endswith(".html") or href.endswith(".htm"):
+            return 1
+        return 1
 
     @staticmethod
     def _parse_candidate_datetime(value: Optional[str]) -> datetime:

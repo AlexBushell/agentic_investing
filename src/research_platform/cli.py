@@ -12,13 +12,17 @@ from research_platform.documents.ixbrl_extractor import (
     IXBRLExtractionError,
     IXBRLExtractor,
 )
+from research_platform.documents.ivf_ixbrl_packet import IVFFIXBRLPacketBuilder
 from research_platform.documents.ixbrl_summary import IXBRLSummarizer
 from research_platform.documents.xhtml_markdown import XHTMLMarkdownRenderer
 from research_platform.documents.xhtml_parser import (
     XHTMLReportParseError,
     XHTMLReportParser,
 )
+from research_platform.frameworks.ivf_pre_screen import IVFPreScreenRunner
 from research_platform.frameworks.registry import load_framework_registry
+from research_platform.llm import create_llm_client
+from research_platform.routing.issuer_router import IssuerRouter
 from research_platform.sources.nsm import (
     NSMDownloadRequest,
     NSMDownloadService,
@@ -215,6 +219,117 @@ def summarize_ixbrl(
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         typer.echo(f"Wrote iXBRL summary to {out}")
+
+
+@app.command("route-issuer")
+def route_issuer(
+    file: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False),
+    out: Optional[Path] = typer.Option(
+        None,
+        help="Optional path for writing the issuer routing profile as JSON.",
+    ),
+) -> None:
+    """Determine issuer archetype and IVF eligibility from an iXBRL XHTML report."""
+    extractor = IXBRLExtractor()
+    summarizer = IXBRLSummarizer()
+    router = IssuerRouter()
+
+    try:
+        extraction = extractor.extract(file)
+    except IXBRLExtractionError as exc:
+        logger.error("iXBRL extraction failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    summary = summarizer.summarize(extraction)
+    routing_profile = router.route(summary=summary, extraction=extraction)
+    payload = routing_profile.model_dump(mode="json")
+    typer.echo(json.dumps(payload, indent=2))
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        typer.echo(f"Wrote issuer routing profile to {out}")
+
+
+@app.command("build-ivf-packet-from-ixbrl")
+def build_ivf_packet_from_ixbrl(
+    file: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False),
+    out: Optional[Path] = typer.Option(
+        None,
+        help="Optional path for writing the IVF packet as JSON.",
+    ),
+) -> None:
+    """Build a broad first-pass IVF packet directly from iXBRL extraction."""
+    extractor = IXBRLExtractor()
+    summarizer = IXBRLSummarizer()
+    router = IssuerRouter()
+    packet_builder = IVFFIXBRLPacketBuilder()
+
+    try:
+        extraction = extractor.extract(file)
+    except IXBRLExtractionError as exc:
+        logger.error("iXBRL extraction failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    summary = summarizer.summarize(extraction)
+    routing_profile = router.route(summary=summary, extraction=extraction)
+    packet = packet_builder.build(
+        summary=summary,
+        extraction=extraction,
+        routing_profile=routing_profile,
+    )
+    payload = packet.model_dump(mode="json")
+    typer.echo(json.dumps(payload, indent=2))
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        typer.echo(f"Wrote IVF packet to {out}")
+
+
+@app.command("run-ivf-pre-screen")
+def run_ivf_pre_screen(
+    packet_file: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False),
+    out: Optional[Path] = typer.Option(
+        None,
+        help="Optional path for writing the validated IVF pre-screen result as JSON.",
+    ),
+    prompt_out: Optional[Path] = typer.Option(
+        None,
+        help="Optional path for writing the raw prompt snapshot.",
+    ),
+    raw_response_out: Optional[Path] = typer.Option(
+        None,
+        help="Optional path for writing the raw model response.",
+    ),
+) -> None:
+    """Run the IVF pre-screen LLM step against a broad packet."""
+    settings = get_settings()
+    packet = json.loads(packet_file.read_text(encoding="utf-8"))
+    llm_client = create_llm_client(settings)
+    runner = IVFPreScreenRunner(
+        llm_client=llm_client,
+        model=settings.llm_model,
+        temperature=settings.ivf_pre_screen_temperature,
+        max_repair_attempts=settings.ivf_pre_screen_max_repair_attempts,
+    )
+    result = runner.run(
+        packet=packet,
+        prompt_out=prompt_out,
+        raw_response_out=raw_response_out,
+    )
+    payload = runner.build_run_payload(
+        packet=packet,
+        result=result,
+        provider=llm_client.provider_name,
+        model=settings.llm_model,
+    )
+    typer.echo(json.dumps(payload, indent=2))
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        typer.echo(f"Wrote IVF pre-screen result to {out}")
 
 
 if __name__ == "__main__":

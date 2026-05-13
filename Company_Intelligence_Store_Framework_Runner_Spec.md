@@ -16,6 +16,16 @@ The system ingests company data, filings, reports, market data, RNS announcement
 
 The first consumer is the **Intrinsic Value Framework Pre-Screen**, but the data store must not be designed as an IVF-only database.
 
+There must also be an explicit routing step before IVF packet construction that answers:
+
+```text
+Can this issuer be analysed successfully?
+What kind of issuer is it?
+Which framework, if any, should consume it next?
+```
+
+This prevents the platform from forcing investment trusts, closed-end funds, asset-backed vehicles, banks, shells, or other structurally different issuers through an operating-company framework by default.
+
 The core architecture is:
 
 ```text
@@ -69,6 +79,8 @@ CUSTOM_FRAMEWORKS
 
 The same underlying company data should feed all of them.
 
+The platform should also support a framework-neutral routing layer before any framework packet is built.
+
 Do not store framework-specific interpretations as core company facts.
 
 For example:
@@ -84,6 +96,15 @@ Framework-specific interpretation:
 ```
 
 The fact belongs in the intelligence store. The interpretation belongs in framework output.
+
+Between those layers, the platform may also store reusable routing judgements such as:
+
+```text
+issuer archetype
+framework eligibility
+preferred next framework
+framework ineligibility reasons
+```
 
 ### 2.2 Deterministic facts first, LLM judgement second
 
@@ -506,6 +527,27 @@ valuation
 ```
 
 Frameworks map topics to their own gates/stages.
+
+Before those gates are applied, the platform should derive a reusable routing profile, for example:
+
+```yaml
+ISSUER_ROUTING_PROFILE:
+  issuer_archetype:
+    one_of:
+      - OPERATING_COMPANY
+      - CLOSED_END_FUND
+      - INVESTMENT_TRUST
+      - REIT
+      - FINANCIAL_INSTITUTION
+      - HOLDCO
+      - SHELL_OR_SPAC
+      - OTHER
+  framework_eligibility:
+    IVF_PRE_SCREEN: ELIGIBLE | INELIGIBLE | MANUAL_REVIEW
+    NDF_PRE_SCREEN: ELIGIBLE | INELIGIBLE | MANUAL_REVIEW
+  ineligibility_reasons: []
+  preferred_next_framework: IVF_PRE_SCREEN | NDF_PRE_SCREEN | OTHER | null
+```
 
 Example:
 
@@ -2123,6 +2165,8 @@ Do not silently overwrite primary-source data.
 
 The IVF Pre-Screen is the first framework implementation.
 
+However, it should not be the first judgement applied to every issuer. A prior routing step should decide whether the issuer is structurally suitable for an operating-company framework at all.
+
 ### 19.1 Purpose
 
 Answer:
@@ -2146,6 +2190,7 @@ position size
 `IVF_PRE_SCREEN` should use:
 
 ```text
+ISSUER_ROUTING_PROFILE
 COMPANY_BASE_PROFILE
 MARKET_SNAPSHOT
 FINANCIAL_HISTORY_5Y
@@ -2163,6 +2208,7 @@ SOURCE_CONFLICTS
 
 ```json
 {
+  "issuer_routing_profile": {},
   "company_facts": {},
   "market_data": {},
   "historical_financial_summary": [],
@@ -2182,6 +2228,21 @@ SOURCE_CONFLICTS
   "source_conflicts": [],
   "data_quality_flags": {}
 }
+```
+
+`gate_0_eligibility` should consume both:
+
+- the routing outcome, including issuer archetype and framework suitability
+- the framework-specific evidence required to decide whether IVF is the right next step
+
+Example routing outcomes:
+
+```text
+OPERATING_COMPANY + IVF_ELIGIBLE
+CLOSED_END_FUND + IVF_INELIGIBLE
+INVESTMENT_TRUST + IVF_INELIGIBLE
+FINANCIAL_INSTITUTION + IVF_INELIGIBLE
+HOLDCO_OR_COMPLEX_STRUCTURE + MANUAL_REVIEW
 ```
 
 ### 19.4 IVF Pre-Screen prompt
@@ -2204,6 +2265,8 @@ Use only the supplied packet and evidence. Prefer primary documents for load-bea
 
 Your task:
 Decide whether the company should proceed to a full IVF v2.7 analysis.
+
+If the packet indicates that the issuer is structurally unsuitable for IVF, do not force an IVF-style judgement. Return a reroute or reject outcome with explicit reasons.
 
 Immediate rejection triggers:
 - Pre-revenue, negligible operations, or no demonstrated earning power.
@@ -2505,6 +2568,9 @@ research init-db
 # Ingest and update company intelligence
 research ingest-company LSE:XYZ
 research refresh-intelligence LSE:XYZ --mode full
+
+# Route issuer to the right framework family
+research route-issuer LSE:XYZ
 
 # Build IVF Pre-Screen packet
 research build-packet LSE:XYZ --framework IVF_PRE_SCREEN

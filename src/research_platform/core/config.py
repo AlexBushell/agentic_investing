@@ -14,10 +14,19 @@ class Settings(BaseSettings):
     data_dir: Path = Path("./data")
     database_url: str = "postgresql+psycopg://postgres:change_me@localhost:5432/company_intelligence"
     pgvector_enabled: bool = True
-    openai_api_key: str = ""
-    openai_model: str = "gpt-5.5"
     default_framework: str = "IVF_PRE_SCREEN"
     default_exchange: str = "LSE"
+    llm_provider: str = "ollama"
+    llm_model: str = "qwen3:14b"
+    llm_timeout_seconds: int = 120
+    ollama_base_url: str = "http://localhost:11434"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_api_key: str = ""
+    openrouter_http_referer: str | None = None
+    openrouter_app_title: str = "company-intelligence-platform"
+    framework_runner_config_path: Path = Path("./config/framework_runner.yaml")
+    ivf_pre_screen_temperature: float = 0.1
+    ivf_pre_screen_max_repair_attempts: int = 1
     nsm_config_path: Path = Path("./config/nsm.yaml")
     nsm_base_url: str = "https://data.fca.org.uk/#/nsm/nationalstoragemechanism"
     nsm_download_dir: Path = Path("./data/downloads/nsm")
@@ -63,8 +72,30 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     settings = Settings()
+    _apply_framework_runner_yaml_defaults(settings)
     _apply_nsm_yaml_defaults(settings)
     return settings
+
+
+def _apply_framework_runner_yaml_defaults(settings: Settings) -> None:
+    config_path = settings.framework_runner_config_path
+    if not config_path.exists():
+        return
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        return
+
+    ivf_config = payload.get("ivf_pre_screen")
+    if not isinstance(ivf_config, dict):
+        return
+
+    _set_if_default(settings, "ivf_pre_screen_temperature", ivf_config.get("temperature"))
+    _set_if_default(
+        settings,
+        "ivf_pre_screen_max_repair_attempts",
+        ivf_config.get("max_repair_attempts"),
+    )
 
 
 def _apply_nsm_yaml_defaults(settings: Settings) -> None:
@@ -77,12 +108,16 @@ def _apply_nsm_yaml_defaults(settings: Settings) -> None:
         return
 
     for key, value in payload.items():
-        if key not in Settings.model_fields:
-            continue
+        _set_if_default(settings, key, value)
 
-        field_info = Settings.model_fields[key]
-        default_value = field_info.default
-        current_value = getattr(settings, key)
-        if current_value == default_value:
-            coerced_value = TypeAdapter(field_info.annotation).validate_python(value)
-            setattr(settings, key, coerced_value)
+
+def _set_if_default(settings: Settings, key: str, value: object) -> None:
+    if value is None or key not in Settings.model_fields:
+        return
+
+    field_info = Settings.model_fields[key]
+    default_value = field_info.default
+    current_value = getattr(settings, key)
+    if current_value == default_value:
+        coerced_value = TypeAdapter(field_info.annotation).validate_python(value)
+        setattr(settings, key, coerced_value)

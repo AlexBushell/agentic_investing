@@ -10,6 +10,8 @@ The key change to the earlier plan is that NSM document acquisition is now the f
 
 One important implementation insight now confirmed by Tesco's filing is that NSM may deliver the annual report as an ESEF or iXBRL package rather than a standalone PDF. That means the first slice should treat the filed XHTML and tagged facts as first-class inputs, with PDF as an optional human-friendly derivative artifact rather than the canonical source.
 
+Another important architecture insight is that not every successfully ingested issuer should flow into IVF. Some issuers, such as closed-end funds, investment trusts, asset-backed vehicles, banks, or shells, may be valid filings to ingest but invalid candidates for the Intrinsic Value Framework. The platform therefore needs a framework-neutral routing or eligibility step before any IVF packet is built.
+
 ## What This First Slice Should Do
 
 Input:
@@ -24,6 +26,7 @@ Output:
 - stored document acquisition metadata
 - stored annual report artifact zip or PDF
 - stored extracted primary XHTML when present
+- stored issuer routing and framework eligibility assessment
 - parsed annual report text, sections, and iXBRL facts
 - extracted IVF-relevant evidence blocks
 - minimal IVF pre-screen packet
@@ -75,6 +78,9 @@ Keep the target architecture, but only implement the minimum live path:
   - `manual.py` for fallback local registration
 - `documents/`
   - storage, XHTML parsing, iXBRL extraction, PDF parsing when available
+- `routing/`
+  - issuer archetype detection
+  - framework eligibility
 - `intelligence/`
   - annual-report evidence extraction
 - `data_products/`
@@ -96,6 +102,8 @@ Use a narrow acquisition target first:
 5. store the artifact and metadata
 
 Do not start by trying to fully automate all document discovery logic. Start with deterministic acquisition for a report of our choosing, then harden search and selection once the downstream parsing and packet-building path exists.
+
+Also do not assume that every acquired annual report should immediately feed IVF. Add an early routing decision once enough structured facts and narrative evidence exist.
 
 ## Increments
 
@@ -193,6 +201,11 @@ Tables to implement first:
 - `framework_packets`
 - `framework_runs`
 
+Add soon after:
+
+- `issuer_routing_runs`
+- `issuer_routing_profiles`
+
 Optional early:
 
 - `raw_api_responses`
@@ -204,6 +217,7 @@ Success:
 
 - create a company
 - register a document
+- store a routing outcome
 - store a packet
 - store a run result
 
@@ -267,7 +281,39 @@ Success:
 - sections identified well enough to target retrieval
 - parse failures recorded cleanly
 
-### Increment 7: IVF-critical evidence extraction
+### Increment 7: Issuer routing and framework eligibility
+
+Goal: determine whether the issuer is structurally suitable for IVF before building any IVF packet.
+
+Build:
+
+- issuer archetype classification, for example:
+  - operating company
+  - closed-end fund / investment trust
+  - REIT
+  - financial institution
+  - holdco
+  - shell / SPAC
+- framework eligibility decision:
+  - `IVF_ELIGIBLE`
+  - `IVF_INELIGIBLE`
+  - `MANUAL_REVIEW`
+- explicit ineligibility reasons
+- preferred next framework or route
+
+Greencoat UK Wind is a good example of why this step matters:
+
+- the platform should ingest it successfully
+- the platform should understand it successfully
+- but it should not automatically route it into IVF
+
+Success:
+
+- at least one operating company is marked IVF-eligible
+- at least one non-operating-company issuer is marked IVF-ineligible or rerouted
+- routing output is stored and auditable
+
+### Increment 8: IVF-critical evidence extraction
 
 Goal: pull the specific evidence the pre-screen actually needs.
 
@@ -301,7 +347,7 @@ Success:
 - evidence items are queryable and traceable back to page and section
 - packet can cite real report evidence
 
-### Increment 8: Minimal structured facts from the annual report
+### Increment 9: Minimal structured facts from the annual report
 
 Goal: stop depending on external APIs for the first useful packet.
 
@@ -325,12 +371,13 @@ Success:
 - packet has enough hard facts to support the framework
 - unknowns are explicit, not silently omitted
 
-### Increment 9: Minimal packet builder
+### Increment 10: Minimal packet builder
 
 Goal: build an IVF pre-screen packet from annual-report-derived facts and evidence.
 
 Packet should include at least:
 
+- issuer routing profile
 - company profile
 - report metadata
 - key financial snapshot
@@ -348,7 +395,7 @@ Success:
 - packet JSON saved to disk and DB
 - packet is stable enough to inspect manually
 
-### Increment 10: IVF pre-screen schema and prompt
+### Increment 11: IVF pre-screen schema and prompt
 
 Goal: run the first real framework.
 
@@ -366,7 +413,7 @@ Success:
 - `research run-framework LSE:XYZ --framework IVF_PRE_SCREEN`
 - valid strict JSON result stored
 
-### Increment 11: Review loop and golden tests
+### Increment 12: Review loop and golden tests
 
 Goal: make the slice trustworthy before expanding scope.
 
@@ -376,6 +423,7 @@ Build tests for:
 - file hashing
 - iXBRL fact extraction
 - XHTML narrative parsing
+- issuer routing and eligibility
 - section detection
 - evidence extraction
 - packet building
@@ -394,7 +442,7 @@ Success:
 - changes to acquisition, extraction, and prompting are detectable
 - pipeline is not fragile
 
-### Increment 12: Arelle-backed XBRL path
+### Increment 13: Arelle-backed XBRL path
 
 Goal: add a production-grade XBRL engine after the first slice is proven.
 
@@ -418,7 +466,7 @@ Success:
 - concept labels and validation are available when needed
 - the pipeline can switch between lightweight and Arelle-backed extraction paths
 
-### Increment 13: Recency layer
+### Increment 14: Recency layer
 
 Goal: patch the main weakness of annual-report-first.
 
@@ -460,6 +508,7 @@ Target these commands first:
 - `research register-annual-report LSE:XYZ --file ./report.zip`
 - `research extract-ixbrl-facts --file ./report.xhtml`
 - `research summarize-ixbrl --file ./report.xhtml`
+- `research route-issuer LSE:XYZ`
 - `research parse-documents LSE:XYZ`
 - `research extract-evidence LSE:XYZ`
 - `research build-packet LSE:XYZ --framework IVF_PRE_SCREEN`
@@ -475,6 +524,7 @@ Later:
 Be strict about these from day one:
 
 - facts and evidence are framework-neutral
+- issuer routing should be framework-neutral and precede IVF packet construction
 - framework judgement lives only in packet and result layers
 - unknowns must stay unknown
 - missing evidence must be explicit
@@ -494,14 +544,15 @@ Recommended order:
 3. make deterministic annual-report artifact download work
 4. add lightweight iXBRL fact extraction and summary
 5. add minimal DB, migrations, and document metadata storage
-6. parse narrative text and section it
-7. extract IVF-relevant evidence
-8. build minimal packet
-9. run IVF pre-screen with strict JSON validation
-10. add tests and golden files
-11. add stronger NSM search and annual report selection logic
-12. add Arelle-backed extraction later
-13. add interim and trading update support
+6. add issuer routing and framework eligibility
+7. parse narrative text and section it
+8. extract IVF-relevant evidence
+9. build minimal packet
+10. run IVF pre-screen with strict JSON validation
+11. add tests and golden files
+12. add stronger NSM search and annual report selection logic
+13. add Arelle-backed extraction later
+14. add interim and trading update support
 
 ## Definition Of Done For The First Slice
 
@@ -510,8 +561,9 @@ The first slice is successful when we can do this for one real company:
 1. search for it in NSM
 2. acquire its annual report artifact
 3. extract structured iXBRL facts and narrative evidence
-4. build a packet with explicit gaps
-5. run the IVF pre-screen
-6. inspect a stored, valid result with citations back to the report
+4. decide whether the issuer is structurally eligible for IVF
+5. if eligible, build a packet with explicit gaps
+6. run the IVF pre-screen
+7. inspect a stored, valid result with citations back to the report
 
 That would prove the most important claim in the project: primary filings can drive a reusable, auditable framework runner, even when source acquisition requires browser automation.
