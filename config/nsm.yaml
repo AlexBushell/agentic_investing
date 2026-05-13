@@ -1,0 +1,29 @@
+nsm_base_url: https://data.fca.org.uk/#/nsm/nationalstoragemechanism
+nsm_download_dir: ./data/downloads/nsm
+nsm_artifact_dir: ./data/artifacts/nsm
+nsm_cookie_accept_selector: "button:has-text('Yes, I agree')"
+nsm_cookie_reject_selector: ""
+nsm_terms_accept_selector: "#acceptDisc"
+nsm_terms_container_selector: ".show_disclaimer"
+nsm_ready_selector: "#orgName"
+nsm_ready_timeout_ms: 20000
+nsm_shell_settle_ms: 750
+nsm_cookie_settle_ms: 500
+nsm_terms_settle_ms: 500
+nsm_loading_overlay_selector: ".ngx-spinner-overlay"
+nsm_loading_timeout_ms: 30000
+nsm_results_container_selector: ".nsmtableData"
+nsm_results_table_selector: "table#table"
+nsm_error_selector: ".nsmError"
+nsm_results_timeout_ms: 30000
+nsm_search_input_selector: "#orgName"
+nsm_category_dropdown_selector: "#headlineCategory"
+nsm_submit_selector: "#Nsm_search"
+nsm_result_row_selector: "tbody#tableBody tr[id^='tablerow-']"
+nsm_result_title_selector: "td[data-before='Description'] .head_link"
+nsm_result_date_selector: "td[data-before='Filing Date/Time'] summary"
+nsm_result_org_name_selector: "td[data-before='Disclosing Organisation Name'] summary"
+nsm_result_category_selector: "td[data-before='Category'] summary"
+nsm_result_link_selector: "td[data-before='Description'] a[href]"
+nsm_download_dialog_selector: "#dialog4"
+nsm_download_button_selector: "#focus4"
