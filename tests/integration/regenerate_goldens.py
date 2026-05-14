@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from research_platform.documents.ixbrl_extractor import IXBRLExtractor
 from research_platform.documents.ixbrl_summary import IXBRLFactSetBuilder
-from research_platform.routing.issuer_router import IssuerRouter
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 GOLDEN_DIR = REPO_ROOT / "tests" / "fixtures" / "golden"
@@ -27,7 +26,6 @@ def main():
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     extractor = IXBRLExtractor()
     builder = IXBRLFactSetBuilder()
-    router = IssuerRouter()
 
     for name, path in XHTML.items():
         if not path.exists():
@@ -36,7 +34,6 @@ def main():
 
         extraction = extractor.extract(path)
         fact_set = builder.build(extraction)
-        routing = router.route(extraction)
 
         (GOLDEN_DIR / f"{name}_extraction_stats.json").write_text(
             json.dumps({
@@ -60,14 +57,9 @@ def main():
             encoding="utf-8",
         )
 
-        (GOLDEN_DIR / f"{name}_routing.json").write_text(
-            routing.model_dump_json(indent=2),
-            encoding="utf-8",
-        )
-
         print(
             f"{name}: {extraction.numeric_fact_count} numeric, "
-            f"{extraction.narrative_fact_count} narrative -> {routing.issuer_archetype}"
+            f"{extraction.narrative_fact_count} narrative facts"
         )
 
     print("Done.")

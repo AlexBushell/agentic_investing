@@ -71,13 +71,14 @@ class IXBRLExtractor:
 
         contexts = self._parse_contexts(root)
         continuations = self._parse_continuations(root)
+        units = self._parse_units(root)
 
         facts: list[IXBRLFact] = []
         numeric_count = 0
         narrative_count = 0
 
         for element in root.iter(f"{{{IX_NS}}}nonFraction"):
-            fact = self._extract_numeric_fact(element=element, contexts=contexts)
+            fact = self._extract_numeric_fact(element=element, contexts=contexts, units=units)
             facts.append(fact)
             numeric_count += 1
 
@@ -148,12 +149,26 @@ class IXBRLExtractor:
                 continuations[continuation_id] = element
         return continuations
 
+    def _parse_units(self, root: ET.Element) -> dict[str, str]:
+        units: dict[str, str] = {}
+        for element in root.iter(f"{{{XBRLI_NS}}}unit"):
+            unit_id = element.get("id")
+            if not unit_id:
+                continue
+            measure = element.find(f"{{{XBRLI_NS}}}measure")
+            if measure is not None and measure.text:
+                raw = measure.text.strip()
+                units[unit_id] = raw.split(":")[-1] if ":" in raw else raw
+        return units
+
     def _extract_numeric_fact(
         self,
         element: ET.Element,
         contexts: dict[str, IXBRLContext],
+        units: dict[str, str],
     ) -> IXBRLFact:
         raw_text = self._text_of(element)
+        unit_ref = element.get("unitRef") or ""
         return IXBRLFact(
             fact_type="numeric",
             id=element.get("id"),
@@ -166,7 +181,7 @@ class IXBRLExtractor:
                 scale=element.get("scale"),
                 sign=element.get("sign"),
             ),
-            unit=element.get("unitRef"),
+            unit=units.get(unit_ref, unit_ref) or None,
             decimals=element.get("decimals"),
             scale=element.get("scale"),
             sign=element.get("sign"),

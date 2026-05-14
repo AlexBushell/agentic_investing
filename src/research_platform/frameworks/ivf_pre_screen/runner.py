@@ -44,11 +44,13 @@ class IVFPreScreenRunner:
             snapshot = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n"
             write_prompt_snapshot(prompt_text=snapshot, out_path=prompt_out)
 
+        schema = IVFPreScreenResult.model_json_schema()
         response = self.llm_client.generate_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model=self.model,
             temperature=self.temperature,
+            response_schema=schema,
         )
         if raw_response_out is not None:
             raw_response_out.parent.mkdir(parents=True, exist_ok=True)
@@ -70,6 +72,7 @@ class IVFPreScreenRunner:
                     user_prompt=repair_prompt,
                     model=self.model,
                     temperature=self.temperature,
+                    response_schema=schema,
                 )
                 current_text = repaired.text
                 if raw_response_out is not None:

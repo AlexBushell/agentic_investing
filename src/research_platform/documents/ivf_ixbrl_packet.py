@@ -9,7 +9,6 @@ from research_platform.documents.ixbrl_summary import (
     IXBRLNarrativeFact,
     IXBRLNumericFact,
 )
-from research_platform.routing.issuer_router import IssuerRoutingProfile
 
 
 class PacketNumericFact(BaseModel):
@@ -30,7 +29,6 @@ class PacketNarrativeFact(BaseModel):
 
 class IVFFIXBRLPacket(BaseModel):
     packet_type: str = "IVF_PRE_SCREEN_IXBRL_V1"
-    issuer_routing_profile: IssuerRoutingProfile
     report_metadata: dict[str, object]
     numeric_facts: list[PacketNumericFact]
     narrative_facts: list[PacketNarrativeFact]
@@ -39,14 +37,10 @@ class IVFFIXBRLPacket(BaseModel):
 
 
 class IVFFIXBRLPacketBuilder:
-    def build(
-        self,
-        fact_set: IXBRLFactSet,
-        routing_profile: IssuerRoutingProfile,
-    ) -> IVFFIXBRLPacket:
+    def build(self, fact_set: IXBRLFactSet) -> IVFFIXBRLPacket:
         numeric_facts = [self._to_packet_numeric(f) for f in fact_set.numeric_facts]
         narrative_facts = [self._to_packet_narrative(f) for f in fact_set.narrative_facts]
-        evidence_gaps = self._build_evidence_gaps(fact_set, routing_profile)
+        evidence_gaps = self._build_evidence_gaps(fact_set)
 
         report_metadata: dict[str, object] = {
             "file_path": fact_set.file_path,
@@ -63,7 +57,6 @@ class IVFFIXBRLPacketBuilder:
         ]
 
         return IVFFIXBRLPacket(
-            issuer_routing_profile=routing_profile,
             report_metadata=report_metadata,
             numeric_facts=numeric_facts,
             narrative_facts=narrative_facts,
@@ -91,11 +84,7 @@ class IVFFIXBRLPacketBuilder:
             text_length=len(fact.text),
         )
 
-    def _build_evidence_gaps(
-        self,
-        fact_set: IXBRLFactSet,
-        routing_profile: IssuerRoutingProfile,
-    ) -> list[str]:
+    def _build_evidence_gaps(self, fact_set: IXBRLFactSet) -> list[str]:
         gaps: list[str] = []
 
         if not fact_set.numeric_facts:
@@ -110,20 +99,5 @@ class IVFFIXBRLPacketBuilder:
         )
         if not has_going_concern:
             gaps.append("No tagged going concern narrative found in the filing.")
-
-        has_revenue = any(
-            any(
-                term in f.concept.lower().replace(":", "").replace("-", "").replace("_", "")
-                for term in ("revenue", "grossprofit", "turnover")
-            )
-            for f in fact_set.numeric_facts
-        )
-        if not has_revenue:
-            gaps.append("No revenue or turnover concept found in numeric facts.")
-
-        if routing_profile.ivf_eligibility != "IVF_ELIGIBLE":
-            gaps.append(
-                f"Issuer is not currently IVF-eligible: {routing_profile.issuer_archetype}"
-            )
 
         return gaps

@@ -4,8 +4,74 @@ import json
 from pathlib import Path
 from textwrap import dedent
 
+from research_platform.frameworks.ivf_pre_screen.packet_renderer import render_packet_for_prompt
+from research_platform.frameworks.ivf_pre_screen.schema import (
+    Gate0Eligibility,
+    Gate1DataSufficiency,
+    Gate2CycleAndEarningsQuality,
+    Gate3Survivability,
+    Gate4DownsideFloor,
+    Gate5TimeDirection,
+    Gate6DislocationSource,
+    IVFPreScreenGateResults,
+    IVFPreScreenResult,
+)
+
 
 PROMPT_VERSION = "ivf_pre_screen_v1"
+_RESULT_SCHEMA = IVFPreScreenResult.model_json_schema()
+_RESULT_EXAMPLE = IVFPreScreenResult(
+    name="Example Company PLC",
+    ticker="EXA",
+    sector="General Retail",
+    status="PASS_WITH_FLAGS",
+    confidence="MEDIUM",
+    target_framework="IVF",
+    killed_at_gate=None,
+    primary_decision_rationale="Profitable mid-cycle retailer with identifiable asset floor; leverage elevated but manageable.",
+    gate_results=IVFPreScreenGateResults(
+        gate_0_eligibility=Gate0Eligibility(
+            result="PASS",
+            rationale="Operating retailer with 10-year trading history, revenue, and external customers.",
+        ),
+        gate_1_data_sufficiency=Gate1DataSufficiency(
+            result="PASS",
+            rationale="Revenue, operating profit, net debt, cash, and lease liabilities all present.",
+            missing_evidence=["Current year interim trading update not available."],
+        ),
+        gate_2_cycle_and_earnings_quality=Gate2CycleAndEarningsQuality(
+            result="FLAG",
+            cycle_position="ABOVE_TREND",
+            rationale="EBIT margins above 10-year average; normalised earnings should be used for valuation.",
+        ),
+        gate_3_survivability=Gate3Survivability(
+            result="PASS",
+            rationale="Net debt 2x EBITDA with adequate covenant headroom and no near-term maturity cliff.",
+            key_risks=["Lease renewal exposure on key sites", "Consumer confidence sensitivity"],
+        ),
+        gate_4_downside_floor=Gate4DownsideFloor(
+            result="PASS",
+            rationale="Freehold property estate and brand value provide two independent and quantifiable floors.",
+            floor_anchors=["Freehold property estate", "Brand and loyalty base"],
+        ),
+        gate_5_time_direction=Gate5TimeDirection(
+            result="PASS",
+            rationale="Volume and margin stable over three years; no structural demand headwinds evident.",
+            time_direction="NEUTRAL",
+        ),
+        gate_6_dislocation_source=Gate6DislocationSource(
+            result="PASS",
+            rationale="Sector-wide derating on macro fears unrelated to company-specific deterioration.",
+            dislocation_source="SECTOR_CONTAGION",
+        ),
+    ),
+    immediate_rejection_triggers_found=[],
+    flags=["Earnings above trend — use normalised figures for IVF valuation"],
+    evidence_gaps=["Interim trading update not available"],
+    likely_ivf_type="A_STRUCTURAL_FLOOR",
+    recommended_next_step="FULL_IVF_RUN",
+    one_sentence_summary="Mid-cycle retailer with above-trend margins and property floor derated on sector-wide macro fears.",
+).model_dump(mode="json")
 
 
 def build_system_prompt() -> str:
@@ -90,13 +156,21 @@ def build_system_prompt() -> str:
 
 
 def build_user_prompt(packet: dict) -> str:
-    packet_json = json.dumps(packet, ensure_ascii=False, indent=2)
+    schema_json = json.dumps(_RESULT_SCHEMA, ensure_ascii=False, indent=2)
+    example_json = json.dumps(_RESULT_EXAMPLE, ensure_ascii=False, indent=2)
+    packet_text = render_packet_for_prompt(packet)
     return dedent(
         f"""
-        Evaluate the following IVF pre-screen packet and return strict JSON matching the agreed schema.
+        Evaluate the following IVF pre-screen packet and return strict JSON matching this schema exactly.
 
-        Packet JSON:
-        {packet_json}
+        Required JSON schema:
+        {schema_json}
+
+        Example output (illustrates structure and valid values — do not copy):
+        {example_json}
+
+        Packet:
+        {packet_text}
         """
     ).strip()
 

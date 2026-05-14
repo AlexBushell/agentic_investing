@@ -22,7 +22,6 @@ from research_platform.documents.xhtml_parser import (
 from research_platform.frameworks.ivf_pre_screen import IVFPreScreenRunner
 from research_platform.frameworks.registry import load_framework_registry
 from research_platform.llm import create_llm_client
-from research_platform.routing.issuer_router import IssuerRouter
 from research_platform.sources.nsm import (
     NSMDownloadRequest,
     NSMDownloadService,
@@ -221,33 +220,6 @@ def summarize_ixbrl(
         typer.echo(f"Wrote iXBRL fact set to {out}")
 
 
-@app.command("route-issuer")
-def route_issuer(
-    file: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False),
-    out: Optional[Path] = typer.Option(
-        None,
-        help="Optional path for writing the issuer routing profile as JSON.",
-    ),
-) -> None:
-    """Determine issuer archetype and IVF eligibility from an iXBRL XHTML report."""
-    extractor = IXBRLExtractor()
-    router = IssuerRouter()
-
-    try:
-        extraction = extractor.extract(file)
-    except IXBRLExtractionError as exc:
-        logger.error("iXBRL extraction failed: %s", exc)
-        raise typer.Exit(code=1) from exc
-
-    routing_profile = router.route(extraction=extraction)
-    payload = routing_profile.model_dump(mode="json")
-    typer.echo(json.dumps(payload, indent=2))
-
-    if out is not None:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        typer.echo(f"Wrote issuer routing profile to {out}")
-
 
 @app.command("build-ivf-packet-from-ixbrl")
 def build_ivf_packet_from_ixbrl(
@@ -260,7 +232,6 @@ def build_ivf_packet_from_ixbrl(
     """Build a first-pass IVF packet from all iXBRL facts in an XHTML annual report."""
     extractor = IXBRLExtractor()
     fact_set_builder = IXBRLFactSetBuilder()
-    router = IssuerRouter()
     packet_builder = IVFFIXBRLPacketBuilder()
 
     try:
@@ -270,11 +241,7 @@ def build_ivf_packet_from_ixbrl(
         raise typer.Exit(code=1) from exc
 
     fact_set = fact_set_builder.build(extraction)
-    routing_profile = router.route(extraction=extraction)
-    packet = packet_builder.build(
-        fact_set=fact_set,
-        routing_profile=routing_profile,
-    )
+    packet = packet_builder.build(fact_set=fact_set)
     payload = packet.model_dump(mode="json")
     typer.echo(json.dumps(payload, indent=2))
 

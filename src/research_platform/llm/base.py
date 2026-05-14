@@ -20,5 +20,6 @@ class LLMClient:
         user_prompt: str,
         model: str,
         temperature: float,
+        response_schema: dict | None = None,
     ) -> LLMResponse:
         raise NotImplementedError

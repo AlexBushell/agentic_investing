@@ -15,7 +15,6 @@ import pytest
 
 from research_platform.documents.ixbrl_extractor import IXBRLExtractor
 from research_platform.documents.ixbrl_summary import IXBRLFactSetBuilder
-from research_platform.routing.issuer_router import IssuerRouter
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 GOLDEN_DIR = REPO_ROOT / "tests" / "fixtures" / "golden"
@@ -132,40 +131,3 @@ def test_greencoat_fact_set_matches_golden():
     assert actual == load_golden("greencoat_fact_set.json")
 
 
-# ---------------------------------------------------------------------------
-# Routing
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(not xhtml_available("tesco"), reason="Tesco XHTML not present")
-def test_tesco_routes_as_operating_company():
-    extraction = IXBRLExtractor().extract(XHTML["tesco"])
-    routing = IssuerRouter().route(extraction)
-    assert routing.issuer_archetype == "OPERATING_COMPANY"
-    assert routing.ivf_eligibility == "IVF_ELIGIBLE"
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(not xhtml_available("gym"), reason="Gym Group XHTML not present")
-def test_gym_routes_as_operating_company():
-    extraction = IXBRLExtractor().extract(XHTML["gym"])
-    routing = IssuerRouter().route(extraction)
-    assert routing.issuer_archetype == "OPERATING_COMPANY"
-    assert routing.ivf_eligibility == "IVF_ELIGIBLE"
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(not xhtml_available("greencoat"), reason="Greencoat XHTML not present")
-def test_greencoat_routing_matches_golden():
-    """
-    Greencoat carries ifrs-full:RevenueAndOperatingIncome (wind energy sales), which
-    currently triggers the operating-company path and overrides the investment-vehicle
-    narrative signals. The golden captures the actual behaviour; revisit routing priority
-    if Greencoat should be INVESTMENT_TRUST_OR_ASSET_BACKED_VEHICLE instead.
-    """
-    extraction = IXBRLExtractor().extract(XHTML["greencoat"])
-    routing = IssuerRouter().route(extraction)
-    golden = load_golden("greencoat_routing.json")
-    assert routing.issuer_archetype == golden["issuer_archetype"]
-    assert routing.ivf_eligibility == golden["ivf_eligibility"]

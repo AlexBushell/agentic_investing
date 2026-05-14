@@ -32,6 +32,7 @@ class OpenRouterClient(LLMClient):
         user_prompt: str,
         model: str,
         temperature: float,
+        response_schema: dict | None = None,
     ) -> LLMResponse:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -41,10 +42,18 @@ class OpenRouterClient(LLMClient):
         if self.http_referer:
             headers["HTTP-Referer"] = self.http_referer
 
+        if response_schema is not None:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": response_schema, "strict": True},
+            }
+        else:
+            response_format = {"type": "json_object"}
+
         payload = {
             "model": model,
             "temperature": temperature,
-            "response_format": {"type": "json_object"},
+            "response_format": response_format,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

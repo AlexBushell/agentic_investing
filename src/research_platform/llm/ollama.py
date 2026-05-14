@@ -21,11 +21,12 @@ class OllamaClient(LLMClient):
         user_prompt: str,
         model: str,
         temperature: float,
+        response_schema: dict | None = None,
     ) -> LLMResponse:
         payload = {
             "model": model,
             "stream": False,
-            "format": "json",
+            "format": response_schema if response_schema is not None else "json",
             "options": {
                 "temperature": temperature,
             },
