@@ -193,19 +193,19 @@ class NSMDownloadService:
         ).first
         dropdown.wait_for(state="visible", timeout=15000)
         dropdown.scroll_into_view_if_needed()
+
         dropdown.click()
 
-        option_locators = [
+        # Wait for options to render.
+        for loc in [
             page.locator("mat-option").filter(has_text=category_label).first,
             page.locator("[role='option']").filter(has_text=category_label).first,
             page.get_by_text(category_label, exact=True).last,
-        ]
-
-        for option in option_locators:
+        ]:
             try:
-                if option.count():
-                    option.wait_for(state="visible", timeout=5000)
-                    option.click()
+                if loc.count():
+                    loc.wait_for(state="visible", timeout=5000)
+                    loc.click()
                     page.wait_for_timeout(300)
                     page.keyboard.press("Escape")
                     return
@@ -340,6 +340,14 @@ class NSMDownloadService:
             return []
 
         rows = page.locator(self.settings.nsm_result_row_selector)
+
+        # NSM renders rows in two batches: migrated (older) records first, then
+        # current-system records. Wait for evidence of the second batch by watching
+        # for tablerow-10 — if it never appears within 5s, we proceed with what we have.
+        try:
+            page.wait_for_selector("#tablerow-10", state="attached", timeout=5000)
+        except Exception:
+            pass
         count = rows.count()
         candidates: list[NSMCandidate] = []
 
@@ -383,7 +391,11 @@ class NSMDownloadService:
                 "esef annual financial report",
             ),
             "interim-report": (
+                "half-year financial report",
+                "half-year results",
+                "half year results",
                 "interim report",
+                "interim results",
                 "half-year report",
                 "half year report",
                 "half-yearly report",
@@ -417,7 +429,7 @@ class NSMDownloadService:
             )
             href_score = NSMDownloadService._candidate_href_score(candidate)
             date_key = NSMDownloadService._parse_candidate_datetime(candidate.date_text)
-            return (org_score, title_score, href_score + match_score, date_key)
+            return (org_score, date_key, title_score, href_score + match_score)
 
         return sorted(candidates, key=score, reverse=True)
 
@@ -435,7 +447,11 @@ class NSMDownloadService:
                 "esef annual financial report",
             ),
             "interim-report": (
+                "half-year financial report",
+                "half-year results",
+                "half year results",
                 "interim report",
+                "interim results",
                 "half-year report",
                 "half year report",
                 "half-yearly report",
@@ -446,7 +462,7 @@ class NSMDownloadService:
             return candidates[0] if candidates else None
 
         best_candidate: Optional[NSMCandidate] = None
-        best_score: tuple[int, int, datetime] | None = None
+        best_score: tuple[datetime, int, int] | None = None
 
         for candidate in candidates:
             haystack = " ".join(
@@ -456,12 +472,12 @@ class NSMDownloadService:
                 continue
 
             candidate_score = (
+                NSMDownloadService._parse_candidate_datetime(candidate.date_text),
                 NSMDownloadService._candidate_title_score(
                     candidate=candidate,
                     document_type=normalized_type,
                 ),
                 NSMDownloadService._candidate_href_score(candidate),
-                NSMDownloadService._parse_candidate_datetime(candidate.date_text),
             )
             if best_score is None or candidate_score > best_score:
                 best_candidate = candidate
@@ -474,6 +490,9 @@ class NSMDownloadService:
         if not href:
             raise NSMSearchError("Selected candidate has no href.")
 
+        if href.strip().lower().endswith(".pdf"):
+            return self._download_pdf(href, download_dir)
+
         response = page.goto(href, wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
 
@@ -482,12 +501,24 @@ class NSMDownloadService:
             content_type = (response.header_value("content-type") or "").lower()
 
         if "application/pdf" in content_type:
-            target = download_dir / "nsm_document.pdf"
-            target.write_bytes(response.body())
-            return target
+            return self._download_pdf(href, download_dir)
 
         target = download_dir / "nsm_document.html"
         target.write_text(page.content(), encoding="utf-8")
+        return target
+
+    @staticmethod
+    def _download_pdf(href: str, download_dir: Path) -> Path:
+        # Fetch directly rather than via browser to avoid PDF viewer interception.
+        import httpx
+        filename = Path(href.split("/")[-1].split("?")[0]) or Path("nsm_document.pdf")
+        if not filename.suffix:
+            filename = Path("nsm_document.pdf")
+        target = download_dir / filename
+        with httpx.Client(follow_redirects=True, timeout=60) as client:
+            response = client.get(href)
+            response.raise_for_status()
+            target.write_bytes(response.content)
         return target
 
     def _download_selected_candidate(
@@ -627,7 +658,7 @@ class NSMDownloadService:
     def _document_type_to_category_label(document_type: str) -> Optional[str]:
         mapping = {
             "annual-report": "Annual Financial Report",
-            "interim-report": "Interim Report",
+            "interim-report": "Half-year Financial Report",
         }
         return mapping.get(document_type.strip().lower())
 
@@ -651,9 +682,13 @@ class NSMDownloadService:
             )
         elif document_type == "interim-report":
             phrase_scores = (
+                ("half-year financial report", 8),
+                ("half-year results", 7),
+                ("half year results", 7),
                 ("half-year report", 7),
                 ("half year report", 7),
                 ("interim report", 6),
+                ("interim results", 6),
                 ("half-yearly report", 6),
                 ("results", 1),
             )

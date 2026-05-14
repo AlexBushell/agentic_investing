@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(python -m pytest tests/unit/ -v)",
-      "Bash(python -m pytest tests/integration/ -v -m integration)"
+      "Bash(python -m pytest tests/integration/ -v -m integration)",
+      "Bash(python -m py_compile src/research_platform/sources/nsm.py)",
+      "Bash(python -m py_compile src/research_platform/sources/nsm.py src/research_platform/cli.py)",
+      "Bash(python -m pytest tests/unit/ -q)"
     ]
   }
 }

@@ -60,7 +60,7 @@ def ingest_nsm_report(
     query: str = typer.Option(..., help="Company name or search string."),
     document_type: str = typer.Option(
         "annual-report",
-        help="Document type hint for later result filtering.",
+        help="Document type to fetch: annual-report or interim-report.",
     ),
     headed: bool = typer.Option(
         False,
@@ -81,7 +81,7 @@ def ingest_nsm_report(
         help="Optional path for writing run metadata as JSON.",
     ),
 ) -> None:
-    """Run the Playwright-based NSM downloader scaffold."""
+    """Download an NSM filing for a company. Run once per document type."""
     settings = get_settings()
     service = NSMDownloadService(settings=settings)
     request = NSMDownloadRequest(
@@ -224,12 +224,23 @@ def summarize_ixbrl(
 @app.command("build-ivf-packet-from-ixbrl")
 def build_ivf_packet_from_ixbrl(
     file: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False),
+    post_period_file: Optional[Path] = typer.Option(
+        None,
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        help="Optional half-year, interim, or trading-update XHTML to include as a post-period update.",
+    ),
+    post_period_type: str = typer.Option(
+        "INTERIM_OR_UPDATE",
+        help="Label for the post-period file, e.g. HALF_YEAR_REPORT or TRADING_UPDATE.",
+    ),
     out: Optional[Path] = typer.Option(
         None,
         help="Optional path for writing the IVF packet as JSON.",
     ),
 ) -> None:
-    """Build a first-pass IVF packet from all iXBRL facts in an XHTML annual report."""
+    """Build a first-pass IVF packet from an annual report XHTML, with optional post-period update."""
     extractor = IXBRLExtractor()
     fact_set_builder = IXBRLFactSetBuilder()
     packet_builder = IVFFIXBRLPacketBuilder()
@@ -241,7 +252,21 @@ def build_ivf_packet_from_ixbrl(
         raise typer.Exit(code=1) from exc
 
     fact_set = fact_set_builder.build(extraction)
-    packet = packet_builder.build(fact_set=fact_set)
+
+    post_period_fact_set = None
+    if post_period_file is not None:
+        try:
+            post_extraction = extractor.extract(post_period_file)
+        except IXBRLExtractionError as exc:
+            logger.error("Post-period iXBRL extraction failed: %s", exc)
+            raise typer.Exit(code=1) from exc
+        post_period_fact_set = fact_set_builder.build(post_extraction)
+
+    packet = packet_builder.build(
+        fact_set=fact_set,
+        post_period_fact_set=post_period_fact_set,
+        post_period_type=post_period_type,
+    )
     payload = packet.model_dump(mode="json")
     typer.echo(json.dumps(payload, indent=2))
 

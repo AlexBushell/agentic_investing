@@ -17,6 +17,7 @@ nsm_results_table_selector: "table#table"
 nsm_error_selector: ".nsmError"
 nsm_results_timeout_ms: 30000
 nsm_search_input_selector: "#orgName"
+# Known category labels: "Annual Financial Report", "Half-year Financial Report"
 nsm_category_dropdown_selector: "#headlineCategory"
 nsm_submit_selector: "#Nsm_search"
 nsm_result_row_selector: "tbody#tableBody tr[id^='tablerow-']"

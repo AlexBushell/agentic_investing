@@ -12,6 +12,7 @@ MAX_NARRATIVE_SECTIONS = 20
 def render_packet_for_prompt(packet: dict) -> str:
     sections = [
         _render_header(packet),
+        _render_recency(packet),
         _render_income_statement(packet),
         _render_balance_sheet(packet),
         _render_narratives(packet),
@@ -23,6 +24,38 @@ def render_packet_for_prompt(packet: dict) -> str:
 # ---------------------------------------------------------------------------
 # Section renderers
 # ---------------------------------------------------------------------------
+
+
+def _render_recency(packet: dict) -> str:
+    rec = packet.get("recency", {})
+    if not rec:
+        return ""
+
+    lines = ["### Data Recency"]
+
+    annual_end = rec.get("annual_period_end")
+    annual_age = rec.get("annual_age_months")
+    if annual_end:
+        age_str = f" ({annual_age} months ago)" if annual_age is not None else ""
+        lines.append(f"- Annual report period end: {_fmt_date(annual_end)}{age_str}")
+
+    if rec.get("post_period_update_available"):
+        post_end = rec.get("post_period_end")
+        post_age = rec.get("post_period_age_months")
+        post_type = rec.get("post_period_type") or "post-period update"
+        age_str = f" ({post_age} months ago)" if post_age is not None else ""
+        date_str = f": {_fmt_date(post_end)}{age_str}" if post_end else ""
+        lines.append(f"- Post-period update available ({post_type}){date_str}")
+    else:
+        if rec.get("is_stale"):
+            lines.append(
+                "- **NO POST-PERIOD UPDATE SUPPLIED** — developments since the annual "
+                "report period end are not reflected in this packet."
+            )
+        else:
+            lines.append("- No post-period update supplied.")
+
+    return "\n".join(lines)
 
 
 def _render_header(packet: dict) -> str:
