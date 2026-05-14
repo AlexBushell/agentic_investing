@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/unit/ -v)",
+      "Bash(python -m pytest tests/integration/ -v -m integration)"
+    ]
+  }
+}

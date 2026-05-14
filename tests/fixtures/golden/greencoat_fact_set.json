@@ -1,0 +1,26 @@
+{
+  "entity": "213800ZPBBK8H51RX165",
+  "latest_duration_end_date": "2025-12-31",
+  "latest_instant_date": "2025-12-31",
+  "numeric_fact_count": 143,
+  "narrative_fact_count": 86,
+  "top_numeric_concepts": [
+    "ifrs-full:TreasuryShares",
+    "ifrs-full:TradeAndOtherCurrentReceivables",
+    "ifrs-full:TradeAndOtherCurrentPayables",
+    "ifrs-full:ShorttermBorrowings",
+    "ifrs-full:SharePremium",
+    "ifrs-full:SaleOrIssueOfTreasuryShares",
+    "ifrs-full:SaleOrIssueOfTreasuryShares",
+    "ifrs-full:SaleOrIssueOfTreasuryShares",
+    "ifrs-full:RevenueAndOperatingIncome",
+    "ifrs-full:RetainedEarnings"
+  ],
+  "top_narrative_concepts": [
+    "ifrs-full:DisclosureOfMaterialAccountingPolicyInformationExplanatory",
+    "ifrs-full:DisclosureOfRelatedPartyExplanatory",
+    "ifrs-full:DisclosureOfFinancialInstrumentsExplanatory",
+    "ifrs-full:DisclosureOfFinancialRiskManagementExplanatory",
+    "ifrs-full:DisclosureOfSignificantInvestmentsInAssociatesExplanatory"
+  ]
+}

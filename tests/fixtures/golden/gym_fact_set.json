@@ -1,0 +1,26 @@
+{
+  "entity": "213800VCU9TBANZIN455",
+  "latest_duration_end_date": "2025-12-31",
+  "latest_instant_date": "2025-12-31",
+  "numeric_fact_count": 236,
+  "narrative_fact_count": 140,
+  "top_numeric_concepts": [
+    "thegymgroupplc:UnderlyingDepreciationAndAmortisation",
+    "thegymgroupplc:TotalGroupAdjustedEBITDAOperatingProfitBeforeDepreciationAmortisationShareBasedPaymentsCostsAndNonUnderlyingItems",
+    "thegymgroupplc:TotalGroupAdjustedEBITDAOperatingProfitBeforeDecpreciationAmortisationShareBasedPaymentsAndNonUnderlyingItemsLessNormalisedRentBEingContractualRentPayableRecognisedInTheMonthlyPeriodToWhichItRelates",
+    "thegymgroupplc:SettlementOfShareBasedPaymentsThroughEBTClassifiedAsFinancingActivities",
+    "thegymgroupplc:PurchaseOfOwnSharesByEBT",
+    "thegymgroupplc:PurchaseOfOwnSharesByEBT",
+    "thegymgroupplc:PaymentOfFinancingFeesClassifiedAsFinancingActivities",
+    "thegymgroupplc:OwnSharesReserveEBT",
+    "thegymgroupplc:OperatingExpensesBeforeDepreciationAmortisationAndImpairment",
+    "thegymgroupplc:OperatingExpensesBeforeDepreciationAmortisationAndImpairment"
+  ],
+  "top_narrative_concepts": [
+    "ifrs-full:DisclosureOfMaterialAccountingPolicyInformationExplanatory",
+    "ifrs-full:DisclosureOfSharebasedPaymentArrangementsExplanatory",
+    "ifrs-full:DisclosureOfFinancialInstrumentsExplanatory",
+    "ifrs-full:DescriptionOfAccountingPolicyForLeasesExplanatory",
+    "ifrs-full:DisclosureOfGoingConcernExplanatory"
+  ]
+}

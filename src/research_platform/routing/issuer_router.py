@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from research_platform.documents.ixbrl_extractor import IXBRLExtractionResult
-from research_platform.documents.ixbrl_summary import IXBRLSummaryResult
+from research_platform.documents.ixbrl_extractor import IXBRLExtractionResult, IXBRLFact
 
 
 class IssuerRoutingProfile(BaseModel):
@@ -15,15 +14,8 @@ class IssuerRoutingProfile(BaseModel):
 
 
 class IssuerRouter:
-    def route(
-        self,
-        summary: IXBRLSummaryResult,
-        extraction: IXBRLExtractionResult,
-    ) -> IssuerRoutingProfile:
-        metrics = {metric.name: metric for metric in summary.key_metrics}
-        revenue = metrics.get("revenue")
-        gross_profit = metrics.get("gross_profit")
-
+    def route(self, extraction: IXBRLExtractionResult) -> IssuerRoutingProfile:
+        has_revenue = self._has_revenue_concept(extraction.facts)
         narrative_text = " ".join(
             fact.text or ""
             for fact in extraction.facts
@@ -48,7 +40,7 @@ class IssuerRouter:
             "capital adequacy",
         )
 
-        if any(signal in narrative_text for signal in investment_signals) and revenue is None:
+        if any(signal in narrative_text for signal in investment_signals) and not has_revenue:
             signals.append("investment_vehicle_language_detected")
             reasons.append(
                 "Issuer appears to be an investment or asset-backed vehicle rather than an operating company."
@@ -61,7 +53,7 @@ class IssuerRouter:
                 signals=signals,
             )
 
-        if revenue is not None or gross_profit is not None:
+        if has_revenue:
             signals.append("operating_metrics_detected")
             return IssuerRoutingProfile(
                 issuer_archetype="OPERATING_COMPANY",
@@ -85,7 +77,7 @@ class IssuerRouter:
 
         signals.append("insufficient_operating_signals")
         reasons.append(
-            "No clear operating-company revenue or gross-profit signal was found in the latest iXBRL summary."
+            "No clear operating-company revenue signal was found in the iXBRL facts."
         )
         return IssuerRoutingProfile(
             issuer_archetype="MANUAL_REVIEW",
@@ -94,3 +86,13 @@ class IssuerRouter:
             ineligibility_reasons=reasons,
             signals=signals,
         )
+
+    @staticmethod
+    def _has_revenue_concept(facts: list[IXBRLFact]) -> bool:
+        for fact in facts:
+            if fact.fact_type != "numeric" or not fact.concept or fact.value is None:
+                continue
+            key = fact.concept.lower().replace(":", "").replace("-", "").replace("_", "")
+            if any(term in key for term in ("revenue", "grossprofit", "turnover")):
+                return True
+        return False

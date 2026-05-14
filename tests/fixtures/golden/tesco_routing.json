@@ -1,0 +1,9 @@
+{
+  "issuer_archetype": "OPERATING_COMPANY",
+  "ivf_eligibility": "IVF_ELIGIBLE",
+  "preferred_next_framework": "IVF_PRE_SCREEN",
+  "ineligibility_reasons": [],
+  "signals": [
+    "operating_metrics_detected"
+  ]
+}

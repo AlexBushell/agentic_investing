@@ -13,7 +13,7 @@ from research_platform.documents.ixbrl_extractor import (
     IXBRLExtractor,
 )
 from research_platform.documents.ivf_ixbrl_packet import IVFFIXBRLPacketBuilder
-from research_platform.documents.ixbrl_summary import IXBRLSummarizer
+from research_platform.documents.ixbrl_summary import IXBRLFactSetBuilder
 from research_platform.documents.xhtml_markdown import XHTMLMarkdownRenderer
 from research_platform.documents.xhtml_parser import (
     XHTMLReportParseError,
@@ -198,12 +198,12 @@ def summarize_ixbrl(
     file: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False),
     out: Optional[Path] = typer.Option(
         None,
-        help="Optional path for writing the iXBRL summary as JSON.",
+        help="Optional path for writing the iXBRL fact set as JSON.",
     ),
 ) -> None:
-    """Summarize key metrics and tagged disclosures from an iXBRL XHTML report."""
+    """Extract and deduplicate all iXBRL facts from an XHTML annual report."""
     extractor = IXBRLExtractor()
-    summarizer = IXBRLSummarizer()
+    builder = IXBRLFactSetBuilder()
 
     try:
         extraction = extractor.extract(file)
@@ -211,14 +211,14 @@ def summarize_ixbrl(
         logger.error("iXBRL extraction failed: %s", exc)
         raise typer.Exit(code=1) from exc
 
-    summary = summarizer.summarize(extraction)
-    payload = summary.model_dump(mode="json")
+    fact_set = builder.build(extraction)
+    payload = fact_set.model_dump(mode="json")
     typer.echo(json.dumps(payload, indent=2))
 
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        typer.echo(f"Wrote iXBRL summary to {out}")
+        typer.echo(f"Wrote iXBRL fact set to {out}")
 
 
 @app.command("route-issuer")
@@ -231,7 +231,6 @@ def route_issuer(
 ) -> None:
     """Determine issuer archetype and IVF eligibility from an iXBRL XHTML report."""
     extractor = IXBRLExtractor()
-    summarizer = IXBRLSummarizer()
     router = IssuerRouter()
 
     try:
@@ -240,8 +239,7 @@ def route_issuer(
         logger.error("iXBRL extraction failed: %s", exc)
         raise typer.Exit(code=1) from exc
 
-    summary = summarizer.summarize(extraction)
-    routing_profile = router.route(summary=summary, extraction=extraction)
+    routing_profile = router.route(extraction=extraction)
     payload = routing_profile.model_dump(mode="json")
     typer.echo(json.dumps(payload, indent=2))
 
@@ -259,9 +257,9 @@ def build_ivf_packet_from_ixbrl(
         help="Optional path for writing the IVF packet as JSON.",
     ),
 ) -> None:
-    """Build a broad first-pass IVF packet directly from iXBRL extraction."""
+    """Build a first-pass IVF packet from all iXBRL facts in an XHTML annual report."""
     extractor = IXBRLExtractor()
-    summarizer = IXBRLSummarizer()
+    fact_set_builder = IXBRLFactSetBuilder()
     router = IssuerRouter()
     packet_builder = IVFFIXBRLPacketBuilder()
 
@@ -271,11 +269,10 @@ def build_ivf_packet_from_ixbrl(
         logger.error("iXBRL extraction failed: %s", exc)
         raise typer.Exit(code=1) from exc
 
-    summary = summarizer.summarize(extraction)
-    routing_profile = router.route(summary=summary, extraction=extraction)
+    fact_set = fact_set_builder.build(extraction)
+    routing_profile = router.route(extraction=extraction)
     packet = packet_builder.build(
-        summary=summary,
-        extraction=extraction,
+        fact_set=fact_set,
         routing_profile=routing_profile,
     )
     payload = packet.model_dump(mode="json")

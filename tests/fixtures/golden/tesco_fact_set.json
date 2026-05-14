@@ -1,0 +1,26 @@
+{
+  "entity": "2138002P5RNKC5W2JZ46",
+  "latest_duration_end_date": "2025-02-22",
+  "latest_instant_date": "2025-02-22",
+  "numeric_fact_count": 503,
+  "narrative_fact_count": 158,
+  "top_numeric_concepts": [
+    "tescoplc:TransferFromTranslationReserveToRetainedEarnings",
+    "tescoplc:TransferFromTranslationReserveToRetainedEarnings",
+    "tescoplc:TotalInventoryCashFlowHedgeMovements",
+    "tescoplc:TotalInventoryCashFlowHedgeMovements",
+    "tescoplc:TotalInventoryCashFlowHedgeMovements",
+    "tescoplc:RevenueFromSaleOfGoodsAndServices",
+    "tescoplc:RevenueFromSaleOfGoodsAndServices",
+    "tescoplc:RepaymentOfCapitalElementOfObligationsUnderLeasesClassifiedAsFinancingActivities",
+    "tescoplc:PurchaseOfPropertyPlantAndEquipmentAndInvestmentPropertyClassifiedAsInvestingActivities",
+    "tescoplc:ProceedsFromSaleOfPropertyPlantAndEquipmentInvestmentPropertyIntangibleAssetsAndAssetsClassifiedAsHeldForSale"
+  ],
+  "top_narrative_concepts": [
+    "ifrs-full:DisclosureOfMaterialAccountingPolicyInformationExplanatory",
+    "ifrs-full:DisclosureOfFinancialRiskManagementExplanatory",
+    "ifrs-full:DisclosureOfInterestsInOtherEntitiesExplanatory",
+    "ifrs-full:DisclosureOfMarketRiskExplanatory",
+    "ifrs-full:DisclosureOfEmployeeBenefitsExplanatory"
+  ]
+}
