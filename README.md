@@ -1,94 +1,136 @@
 # Company Intelligence Platform
 
-This repository is the starting point for a local-first company intelligence store and framework runner, with the first working slice focused on acquiring annual reports from the FCA National Storage Mechanism and using them to support an IVF pre-screen.
+A local-first company intelligence store and framework runner. The first working slice acquires annual reports and half-year results from the FCA National Storage Mechanism, parses iXBRL facts, and runs an LLM-powered IVF pre-screen.
 
-## Current Focus
+**Current status:** end-to-end slice proven. Tesco PLC returns PASS_WITH_FLAGS / HIGH confidence from Gemma 4 via Ollama.
 
-The first active vertical slice is:
+The full roadmap and next work are in [IVF_PreScreen_First_Slice_Roadmap.md](IVF_PreScreen_First_Slice_Roadmap.md).
 
-- Playwright-based NSM browser automation
-- annual report acquisition and storage
-- annual-report-led IVF pre-screen scaffolding
-
-The roadmap for that slice lives in [IVF_PreScreen_First_Slice_Roadmap.md](C:\dev\agentic investing\IVF_PreScreen_First_Slice_Roadmap.md).
+---
 
 ## Local Setup
 
-Use one repo-level virtual environment for the whole project. At this stage, the acquisition, parsing, storage, and framework runner pieces are part of one application, so a single `.venv` keeps setup and dependency management much simpler.
+### 1. Create and activate a virtual environment
 
-1. Create and activate a virtual environment in the repo root:
-
-```powershell
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/Scripts/activate   # Windows Git Bash
+# or on PowerShell: .\.venv\Scripts\Activate.ps1
 ```
 
-2. Install the project in editable mode:
+### 2. Install the project in editable mode with dev dependencies
 
-```powershell
-pip install -e .
+```bash
+pip install -e ".[dev]"
 ```
 
-3. Install Playwright browsers:
+### 3. Install Playwright browsers
 
-```powershell
+```bash
 python -m playwright install
 ```
 
-4. Copy `.env.example` to `.env` and fill in the database and API settings.
+### 4. Copy and fill in the environment file
 
-```powershell
-Copy-Item .env.example .env
+```bash
+cp .env.example .env
 ```
 
-5. Confirm the CLI entrypoint works:
+Key values to set in `.env`:
 
-```powershell
+| Variable | Description |
+|---|---|
+| `LLM_PROVIDER` | `ollama` or `openrouter` |
+| `LLM_MODEL` | e.g. `gemma4` for Ollama |
+| `OLLAMA_BASE_URL` | Default `http://localhost:11434` |
+| `OPENROUTER_API_KEY` | Required when using OpenRouter |
+| `DATABASE_URL` | PostgreSQL connection string (persistence not yet wired) |
+
+### 5. Confirm the CLI works
+
+```bash
 research list-frameworks
 ```
 
-## Environment Strategy
-
-For now, use:
-
-- one repo
-- one `.venv`
-- one `pyproject.toml`
-
-Do not create separate virtual environments per subsystem unless the project later splits into genuinely independent services. If we need separation later, prefer dependency groups or optional extras before introducing multiple environments.
-
-## Useful Commands
-
-List the registered frameworks:
-
-```powershell
-research list-frameworks
-```
-
-Show the configured database target:
-
-```powershell
-research init-db
-```
-
-Run the NSM downloader scaffold in a visible browser:
-
-```powershell
-research ingest-nsm-report --query "Company Name" --headed
-```
-
-The NSM downloader captures debug artifacts as it works through the live FCA flow. If the site markup changes, update [config/nsm.yaml](C:\dev\agentic investing\config\nsm.yaml) rather than editing `.env`.
+---
 
 ## Configuration
 
-Keep deployment-specific values in `.env`, such as:
+| File | Purpose |
+|---|---|
+| `.env` | Deployment secrets — API keys, DB URL, model choice |
+| `config/nsm.yaml` | NSM site selectors and timeouts — versioned, update when FCA markup changes |
+| `config/framework_runner.yaml` | Per-framework LLM settings — temperature, repair attempts |
 
-- `DATABASE_URL`
-- `LLM_PROVIDER`
-- `LLM_MODEL`
-- `OPENROUTER_API_KEY`
-- `BROWSER_CHANNEL`
+---
 
-Keep NSM site behavior and selectors in [config/nsm.yaml](C:\dev\agentic investing\config\nsm.yaml). That file is versioned with the repo because it describes how our downloader interacts with a specific source, and we want changes to those selectors and timings to be visible in git history.
+## Full Pipeline
 
-Keep framework-runner behavior in [config/framework_runner.yaml](C:\dev\agentic investing\config\framework_runner.yaml). That includes framework-specific knobs such as the IVF pre-screen temperature and repair policy, which are better treated as versioned application behavior than deployment secrets.
+### Acquire documents
+
+```bash
+# Annual report (XBRL package — most recent)
+research ingest-nsm-report --query "Tesco PLC" --document-type annual-report \
+  --out data/artifacts/nsm/tesco-plc/tesco_annual_meta.json
+
+# Half-year report (HTML RNS announcement or XBRL — most recent)
+research ingest-nsm-report --query "Tesco PLC" --document-type interim-report \
+  --out data/artifacts/nsm/tesco-plc/tesco_interim_meta.json
+```
+
+Add `--headed` to watch the browser and debug site changes.
+
+### Inspect the iXBRL facts
+
+```bash
+research extract-ixbrl-facts \
+  --file "data/downloads/nsm/tesco-plc/<annual-xhtml-path>" \
+  --out data/artifacts/nsm/tesco-plc/tesco_ixbrl.json
+
+research summarize-ixbrl \
+  --file "data/downloads/nsm/tesco-plc/<annual-xhtml-path>" \
+  --out data/artifacts/nsm/tesco-plc/tesco_fact_set.json
+```
+
+### Build the IVF packet
+
+```bash
+research build-ivf-packet-from-ixbrl \
+  --file "data/downloads/nsm/tesco-plc/<annual-xhtml-path>" \
+  --out data/artifacts/nsm/tesco-plc/tesco_ivf_packet.json
+```
+
+Pass `--post-period-file` with the path from the interim meta JSON to include the half-year update in the packet.
+
+### Run the IVF pre-screen
+
+```bash
+research run-ivf-pre-screen \
+  --packet-file data/artifacts/nsm/tesco-plc/tesco_ivf_packet.json \
+  --out data/artifacts/nsm/tesco-plc/tesco_ivf_result.json \
+  --prompt-out data/artifacts/nsm/tesco-plc/tesco_prompt.txt \
+  --raw-response-out data/artifacts/nsm/tesco-plc/tesco_raw_response.json
+```
+
+Requires a running Ollama instance (`ollama serve`) or a valid OpenRouter API key.
+
+---
+
+## Running Tests
+
+```bash
+# Unit tests only (no data files required)
+pytest tests/unit/
+
+# Integration tests (requires downloaded XHTML files in data/downloads/)
+pytest tests/integration/ -m integration
+
+# Regenerate golden files after intentional output changes
+python tests/integration/regenerate_goldens.py
+```
+
+---
+
+## Environment Strategy
+
+One repo, one `.venv`, one `pyproject.toml`. Do not create separate virtual environments per subsystem. If separation is needed later, prefer dependency groups or optional extras.

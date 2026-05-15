@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_http_referer: str | None = None
     openrouter_app_title: str = "company-intelligence-platform"
+    openfigi_api_key: str = ""
     framework_runner_config_path: Path = Path("./config/framework_runner.yaml")
     ivf_pre_screen_temperature: float = 0.1
     ivf_pre_screen_max_repair_attempts: int = 1

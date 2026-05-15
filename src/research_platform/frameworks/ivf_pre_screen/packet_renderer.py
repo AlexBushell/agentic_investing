@@ -7,15 +7,19 @@ MAX_NARRATIVE_CHARS = 1000
 MAX_DURATION_ROWS = 40
 MAX_INSTANT_ROWS = 40
 MAX_NARRATIVE_SECTIONS = 20
+MAX_POST_PERIOD_NARRATIVE_CHARS = 4000
 
 
 def render_packet_for_prompt(packet: dict) -> str:
     sections = [
         _render_header(packet),
         _render_recency(packet),
+        _render_market_data(packet),
+        _render_annual_narrative(packet),
         _render_income_statement(packet),
         _render_balance_sheet(packet),
         _render_narratives(packet),
+        _render_post_period_narrative(packet),
         _render_evidence_gaps(packet),
     ]
     return "\n\n".join(s for s in sections if s)
@@ -58,14 +62,127 @@ def _render_recency(packet: dict) -> str:
     return "\n".join(lines)
 
 
+def _render_market_data(packet: dict) -> str:
+    md = packet.get("market_data") or {}
+    if not md:
+        return ""
+
+    snap = md.get("snapshot") or {}
+    hist = md.get("history") or {}
+    currency = snap.get("currency", "GBP")
+    lines = [f"### Market Data (as at {snap.get('as_of', 'unknown')})"]
+
+    price = _fmt_ccy(snap.get("price"), currency)
+    cap = _fmt_ccy(snap.get("market_cap"), currency)
+    ev = _fmt_ccy(snap.get("enterprise_value"), currency)
+    hi = _fmt_ccy(snap.get("week_52_high"), currency)
+    lo = _fmt_ccy(snap.get("week_52_low"), currency)
+    shares = _fmt_shares(snap.get("shares_outstanding"))
+
+    lines.append(f"Price: {price} | Market cap: {cap} | EV: {ev}")
+    lines.append(f"52-week range: {lo} – {hi} | Shares: {shares}")
+
+    years = hist.get("years") or []
+    if years:
+        lines.append("")
+        lines.append("**Financial History**")
+        lines.append("| Period | Revenue | Op Profit | Op Margin | FCF | Net Debt |")
+        lines.append("|--------|---------|-----------|-----------|-----|----------|")
+        for yr in years:
+            period = _fmt_year_label(yr.get("period_end", ""))
+            rev = _fmt_ccy(yr.get("revenue"), currency)
+            op = _fmt_ccy(yr.get("operating_profit"), currency)
+            margin = _fmt_pct(yr.get("operating_margin"))
+            fcf = _fmt_ccy(yr.get("free_cash_flow"), currency)
+            nd = _fmt_ccy(yr.get("net_debt"), currency)
+            lines.append(f"| {period} | {rev} | {op} | {margin} | {fcf} | {nd} |")
+
+    return "\n".join(lines)
+
+
+def _render_annual_narrative(packet: dict) -> str:
+    text = packet.get("annual_narrative")
+    if not text:
+        return ""
+    if len(text) > MAX_POST_PERIOD_NARRATIVE_CHARS:
+        text = text[:MAX_POST_PERIOD_NARRATIVE_CHARS].rstrip() + "\n…"
+    return f"### Annual Report (narrative — no iXBRL structure available)\n{text}"
+
+
+def _render_post_period_narrative(packet: dict) -> str:
+    text = packet.get("post_period_narrative")
+    if not text:
+        return ""
+
+    rec = packet.get("recency") or {}
+    post_type = rec.get("post_period_type") or "Post-period update"
+
+    if len(text) > MAX_POST_PERIOD_NARRATIVE_CHARS:
+        text = text[:MAX_POST_PERIOD_NARRATIVE_CHARS].rstrip() + "\n…"
+
+    return f"### Post-period Update ({post_type})\n{text}"
+
+
+def _fmt_ccy(value, currency: str = "GBP") -> str:
+    if value is None:
+        return "—"
+    symbol = {"GBP": "£", "USD": "$", "EUR": "€"}.get(currency, currency + " ")
+    abs_val = abs(float(value))
+    sign = "-" if float(value) < 0 else ""
+    if abs_val >= 1e9:
+        return f"{sign}{symbol}{abs_val / 1e9:.1f}bn"
+    if abs_val >= 1e6:
+        return f"{sign}{symbol}{abs_val / 1e6:.0f}m"
+    if abs_val >= 1e3:
+        return f"{sign}{symbol}{abs_val / 1e3:.1f}k"
+    return f"{sign}{symbol}{abs_val:.2f}"
+
+
+def _fmt_pct(value) -> str:
+    if value is None:
+        return "—"
+    return f"{float(value) * 100:.1f}%"
+
+
+def _fmt_shares(value) -> str:
+    if value is None:
+        return "—"
+    v = float(value)
+    if v >= 1e9:
+        return f"{v / 1e9:.2f}bn"
+    if v >= 1e6:
+        return f"{v / 1e6:.1f}m"
+    return f"{v:,.0f}"
+
+
+def _fmt_year_label(period_end: str) -> str:
+    try:
+        from datetime import date
+        d = date.fromisoformat(period_end)
+        return f"{d.strftime('%b')} {d.year}"
+    except ValueError:
+        return period_end or "—"
+
+
 def _render_header(packet: dict) -> str:
     meta = packet.get("report_metadata", {})
+    company_name = meta.get("company_name")
+    ticker = meta.get("ticker")
+    isin = meta.get("isin")
     entity = meta.get("entity") or "Unknown"
     end_date = meta.get("latest_duration_end_date") or ""
     instant_date = meta.get("latest_instant_date") or ""
 
     lines = ["## IVF Pre-Screen Packet"]
-    lines.append(f"Entity: {entity}")
+    if company_name:
+        ident = company_name
+        if ticker:
+            ident += f" ({ticker})"
+        if isin:
+            ident += f" | ISIN: {isin}"
+        lines.append(f"Company: {ident}")
+    else:
+        lines.append(f"Entity: {entity}")
     if end_date:
         lines.append(f"Latest annual period end: {_fmt_date(end_date)}")
     if instant_date:

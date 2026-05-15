@@ -120,6 +120,32 @@ class NSMDownloadService:
                     candidates=candidates,
                     document_type=request.document_type,
                 )
+
+                # If the best match is from the old data-migration archive, retry without
+                # the category filter — some companies (e.g. smaller UK firms) file annual
+                # results under "Final Results" rather than "Annual Financial Report".
+                if self._is_data_migration_result(result.selected_candidate):
+                    result.notes.append(
+                        "Best candidate was a data-migration file; retrying without category filter."
+                    )
+                    broad_request = request.model_copy(
+                        update={"document_type": "annual-report-broad"}
+                    )
+                    self._run_search(page=page, request=broad_request)
+                    broad_candidates = self._collect_candidates(
+                        page=page,
+                        max_results=request.max_results,
+                        query=request.query,
+                        document_type=request.document_type,
+                    )
+                    broad_selected = self._select_candidate(
+                        candidates=broad_candidates,
+                        document_type=request.document_type,
+                    )
+                    if broad_selected and not self._is_data_migration_result(broad_selected):
+                        result.candidates = broad_candidates
+                        result.selected_candidate = broad_selected
+
                 self._capture_artifacts(page=page, artifact_dir=artifact_dir, result=result)
 
                 if result.selected_candidate is None:
@@ -153,6 +179,14 @@ class NSMDownloadService:
                 browser.close()
 
         return result
+
+    @staticmethod
+    def _is_data_migration_result(candidate: Optional[NSMCandidate]) -> bool:
+        """Return True if the candidate href points to an old data-migration file."""
+        if candidate is None:
+            return True
+        href = (candidate.href or "").lower()
+        return "/data-migration/" in href
 
     @retry(
         stop=stop_after_attempt(2),
@@ -389,6 +423,10 @@ class NSMDownloadService:
                 "annual report",
                 "annual results",
                 "esef annual financial report",
+                "audited final results",
+                "final results",
+                "full year results",
+                "preliminary results",
             ),
             "interim-report": (
                 "half-year financial report",
@@ -445,6 +483,10 @@ class NSMDownloadService:
                 "annual report",
                 "annual results",
                 "esef annual financial report",
+                "audited final results",
+                "final results",
+                "full year results",
+                "preliminary results",
             ),
             "interim-report": (
                 "half-year financial report",
@@ -677,8 +719,10 @@ class NSMDownloadService:
                 ("annual report and accounts", 5),
                 ("annual report", 4),
                 ("annual financial report", 3),
-                ("full year results", 1),
-                ("final results", 1),
+                ("audited final results", 6),
+                ("final results", 5),
+                ("full year results", 4),
+                ("preliminary results", 3),
             )
         elif document_type == "interim-report":
             phrase_scores = (

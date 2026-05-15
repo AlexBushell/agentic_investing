@@ -38,6 +38,11 @@ class OllamaClient(LLMClient):
 
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.post(f"{self.base_url}/api/chat", json=payload)
+            if response.status_code == 500 and response_schema is not None:
+                # Grammar-constrained generation can OOM on complex schemas or large prompts.
+                # Fall back to plain JSON mode and rely on the schema embedded in the prompt.
+                payload["format"] = "json"
+                response = client.post(f"{self.base_url}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
 
