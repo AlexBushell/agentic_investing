@@ -14,30 +14,37 @@ The goal of this first slice is not to build the full company intelligence platf
 ```bash
 research run-ivf-screen --isin GB0008847096   # Tesco PLC
 research run-ivf-screen --isin GB00B06QFB75   # IG Group Holdings
+research run-ivf-screen --isin GB0007922338   # Arbuthnot Banking Group
 ```
 
-The pipeline resolves the ISIN via OpenFIGI, downloads both the annual report and latest half-year update from NSM, extracts content (iXBRL or PDF/HTML narrative), fetches live market data from yfinance, assembles a fully rendered LLM-readable packet, runs the IVF pre-screen via Ollama, and writes all outputs to `data/results/<isin>/<date>/`.
+The pipeline resolves the ISIN via OpenFIGI, searches NSM using a manifest-driven approach (single browser session, all document types), downloads the best annual report and post-period update for each role, extracts content (iXBRL or PDF/HTML narrative), fetches live market data from yfinance, assembles a fully rendered LLM-readable packet, runs the IVF pre-screen via Ollama, and writes all outputs to `data/results/<isin>/<date>/`.
 
-**Proven on two different issuer types and document formats:**
+**NSM acquisition uses a document manifest** (`sources/nsm_manifest.py`) that defines priority-ordered category lists for each document role. A single search without a category filter collects all recent filings; the manifest selects the best match per role. This handles companies like Arbuthnot that file under "Final Results" rather than "Annual Financial Report".
 
-| Company | Annual format | Result | Confidence |
-|---|---|---|---|
-| Tesco PLC | XBRL package (iXBRL facts) | PASS_WITH_FLAGS | HIGH |
-| IG Group Holdings | PDF (narrative text only) | PASS_WITH_FLAGS | MEDIUM |
+**Proven on three different issuer types and document formats:**
 
-The pipeline correctly adapts to document format: iXBRL companies get structured fact tables; PDF-only companies get narrative text extraction with the model self-calibrating to MEDIUM confidence and flagging the missing structure in Gate 1.
+| Company | Annual format | Result | Confidence | Note |
+|---|---|---|---|---|
+| Tesco PLC | XBRL package (iXBRL facts) | PASS_WITH_FLAGS | HIGH | |
+| IG Group Holdings | PDF (narrative text only) | PASS_WITH_FLAGS | MEDIUM | |
+| Arbuthnot Banking Group | HTML (Final Results RNS) | PASS_WITH_FLAGS | MEDIUM | Would be filtered pre-screen in production |
+
+The pipeline correctly adapts to document format: iXBRL companies get structured fact tables; PDF/HTML companies get narrative text extraction with the model self-calibrating confidence accordingly.
+
+**Sector filtering decision:** Banks, REITs, and other financial institutions will be filtered *before* the IVF pre-screen runs rather than handled inside the pre-screen prompt. IVF valuation methodology does not apply to entities whose primary assets and liabilities are financial instruments. The filter will use the security type and sector from OpenFIGI/yfinance to exclude these at input.
 
 **What the packet contains:**
 - Company identity from OpenFIGI (name, exchange, Yahoo ticker, ISIN)
-- Annual report content: iXBRL facts (XBRL companies) or PDF narrative text (PDF-only companies)
-- Post-period update: iXBRL facts if XBRL half-year, or HTML/PDF narrative text for RNS-style announcements
-- Live market data: price, market cap, EV, 52-week range, 4-year financial history with margins (yfinance)
+- Annual report content: iXBRL facts (XBRL companies) or PDF/HTML narrative text
+- Post-period update: most recent half-year or trading update, auto-detected format
+- Live market data: price, market cap, EV, 52-week range, 4-year financial history with margins
 - Recency metadata and staleness detection
 
 **Gate performance observed:**
-- Gate 0 correctly passes operating companies and would reroute investment trusts (tested in prior runs)
-- Gate 1 self-calibrates: PASS for iXBRL companies, PARTIAL for PDF-only
-- Gate 2 correctly identifies ABOVE_TREND cycle position from margin history
+- Gate 0 correctly passes operating companies
+- Gate 1 self-calibrates: PASS for iXBRL, PARTIAL for PDF/HTML-only
+- Gate 2 correctly identifies cycle position from margin history and post-period narrative
+- Gate 6 correctly identifies dislocation source when market data is present
 - Gate 6 correctly identifies dislocation source when market data is present (was UNKNOWN before market data was added)
 
 ---
@@ -138,15 +145,24 @@ The lightweight extractor is sufficient. Arelle provides taxonomy-aware labels a
 
 ## Next Work
 
-### 1. REJECT and REROUTE validation
+### 1. Sector filter before pre-screen
 
-The pipeline has been proven on two PASS_WITH_FLAGS companies. The next priority is testing against:
-- A company that should **REJECT** (going concern warning, loss-making, or no quantifiable floor)
-- A company that should **REROUTE to NDF** (investment trust, REIT, or closed-ended fund)
+Add a lightweight filter step to `run-ivf-screen` that uses security type and sector from OpenFIGI (and yfinance as a fallback) to exclude companies where IVF methodology does not apply:
 
-These cases will validate Gate 0 rerouting and the immediate rejection trigger logic — the pre-screen is only half-tested if the reject path has never fired in production.
+- **Regulated financial institutions** — banks, building societies, insurance companies, credit companies
+- **REITs and property investment companies** — NAV-discount situations belong in NDF
+- **Investment trusts and closed-ended funds** — same as above
+- **Shells and SPACs** — no earning power to screen
 
-### 2. Core persistence — Increment 4
+The filter should produce a clear, auditable reason rather than silently refusing. Output something like: `"ARBB.L excluded: regulated deposit-taking bank — IVF methodology not applicable. Consider NDF or bank-specific framework."` and exit cleanly.
+
+The sector signal from OpenFIGI (`market_sector`, `security_type`) and yfinance (`sector`, `industryDisp`) together should be enough for an accurate first pass. Sector names like "Financial Services", "Banks—Regional", "Insurance" are consistent and reliable.
+
+### 2. REJECT validation
+
+The pipeline has been proven on PASS_WITH_FLAGS companies across three document types. The next case to test is a company that should **REJECT** — going concern warning, loss-making with no floor, or immediate rejection trigger. This validates the refusal path which has not yet fired in production.
+
+### 3. Core persistence — Increment 4
 
 SQLAlchemy models and Alembic migrations for:
 

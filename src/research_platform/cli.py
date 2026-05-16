@@ -466,46 +466,37 @@ def run_ivf_screen(
     run_dir.mkdir(parents=True, exist_ok=True)
     typer.echo(f"    {company_name} ({yahoo_ticker}) → {run_dir}")
 
-    # ── 2. NSM annual ────────────────────────────────────────────────────────
-    typer.echo("[2/7] Downloading annual report from NSM...")
+    # ── 2 & 3. NSM document acquisition (manifest-driven, single session) ────
+    typer.echo("[2/7] Acquiring documents from NSM...")
+    from research_platform.sources.nsm_manifest import AcquiredDocumentSet
     nsm_service = NSMDownloadService(settings=settings)
     try:
-        annual_result = nsm_service.run(NSMDownloadRequest(
-            query=company_name, document_type="annual-report",
-            headed=headed, max_results=15,
-        ))
+        doc_set = nsm_service.acquire_document_set(
+            query=company_name, headed=headed, max_candidates=50,
+        )
     except NSMSearchError as exc:
-        logger.error("NSM annual download failed: %s", exc)
+        logger.error("NSM acquisition failed: %s", exc)
         raise typer.Exit(code=1) from exc
 
-    (run_dir / "annual_meta.json").write_text(
-        annual_result.model_dump_json(indent=2), encoding="utf-8"
+    (run_dir / "nsm_document_set.json").write_text(
+        doc_set.model_dump_json(indent=2), encoding="utf-8"
     )
-    if not annual_result.primary_report_file:
-        logger.error("No primary report file in NSM annual download.")
+
+    annual_doc = doc_set.get("annual")
+    if not annual_doc or not annual_doc.primary_report_file:
+        logger.error("No annual report acquired from NSM.")
         raise typer.Exit(code=1)
+    annual_xhtml = Path(annual_doc.primary_report_file)
+    typer.echo(f"    Annual  ({annual_doc.category}): {annual_xhtml.name}")
 
-    annual_xhtml = Path(annual_result.primary_report_file)
-    typer.echo(f"    {annual_xhtml.name}")
-
-    # ── 3. NSM interim (best-effort) ─────────────────────────────────────────
-    typer.echo("[3/7] Downloading interim report from NSM (best-effort)...")
+    post_doc = doc_set.get_post_period()
     interim_file: Optional[Path] = None
-    try:
-        interim_result = nsm_service.run(NSMDownloadRequest(
-            query=company_name, document_type="interim-report",
-            headed=headed, max_results=15,
-        ))
-        (run_dir / "interim_meta.json").write_text(
-            interim_result.model_dump_json(indent=2), encoding="utf-8"
-        )
-        if interim_result.primary_report_file:
-            interim_file = Path(interim_result.primary_report_file)
-            typer.echo(f"    {interim_file.name}")
-        else:
-            typer.echo("    No interim report found.")
-    except NSMSearchError as exc:
-        logger.warning("NSM interim download failed (continuing): %s", exc)
+    if post_doc and post_doc.primary_report_file:
+        interim_file = Path(post_doc.primary_report_file)
+        typer.echo(f"    {post_doc.role.replace('_', ' ').title()} ({post_doc.category}): {interim_file.name}")
+    else:
+        typer.echo("    No post-period document found.")
+    typer.echo(f"    Notes: {'; '.join(doc_set.notes[:3])}")
 
     # ── 4. Annual report content ──────────────────────────────────────────────
     typer.echo("[4/7] Extracting annual report content...")

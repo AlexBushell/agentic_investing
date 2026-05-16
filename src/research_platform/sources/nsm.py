@@ -180,6 +180,157 @@ class NSMDownloadService:
 
         return result
 
+    def acquire_document_set(
+        self,
+        query: str,
+        headed: bool = False,
+        browser_channel: Optional[str] = None,
+        max_candidates: int = 50,
+    ) -> "AcquiredDocumentSet":
+        """Search NSM once without a category filter and acquire the best document
+        for each role defined in NSM_MANIFEST (annual, halfyear, trading_update).
+
+        This replaces running two separate download sessions and handles companies
+        that file under non-standard categories (e.g. 'Final Results' instead of
+        'Annual Financial Report').
+        """
+        from datetime import UTC, datetime, date as _date
+        from research_platform.sources.nsm_manifest import (
+            AcquiredDocument,
+            AcquiredDocumentSet,
+            NSM_MANIFEST,
+        )
+
+        try:
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise NSMSearchError("Playwright is not installed.") from exc
+
+        result = AcquiredDocumentSet(query=query)
+        artifact_dir = self._artifact_dir(query)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        download_dir = self._download_dir(query)
+        download_dir.mkdir(parents=True, exist_ok=True)
+        channel = browser_channel or self.settings.browser_channel
+
+        # Temporary NSMDownloadResult used only to satisfy helper method signatures.
+        _nav_result = NSMDownloadResult(
+            query=query,
+            document_type="all",
+            acquired_at=datetime.now(UTC),
+            base_url=self.settings.nsm_base_url,
+        )
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=not headed, channel=channel)
+            context = browser.new_context(accept_downloads=True)
+            page = context.new_page()
+            try:
+                page.goto(self.settings.nsm_base_url, wait_until="domcontentloaded")
+                page.wait_for_load_state("networkidle")
+                self._wait_for_shell(page=page, result=_nav_result)
+                self._dismiss_cookie_banner(page=page, result=_nav_result)
+                self._accept_terms_if_present(page=page, result=_nav_result)
+                self._wait_for_shell(page=page, result=_nav_result)
+                self._wait_for_loading_to_finish(page=page, result=_nav_result)
+
+                # Search without category filter so all document types are returned.
+                broad_request = NSMDownloadRequest(
+                    query=query,
+                    document_type="all",  # not in category map → no filter applied
+                    headed=headed,
+                    browser_channel=browser_channel,
+                    max_results=max_candidates,
+                )
+                self._run_search(page=page, request=broad_request)
+                all_candidates = self._collect_candidates(
+                    page=page,
+                    max_results=max_candidates,
+                    query=query,
+                    document_type="all",
+                )
+                result.all_candidates = [c.model_dump() for c in all_candidates]
+                result.notes.append(f"Found {len(all_candidates)} total candidates.")
+
+                # Save a screenshot of the search results for debugging.
+                try:
+                    artifact_dir.mkdir(parents=True, exist_ok=True)
+                    page.screenshot(path=str(artifact_dir / "nsm_page.png"), full_page=True)
+                    (artifact_dir / "nsm_page.html").write_text(page.content(), encoding="utf-8")
+                except Exception:
+                    pass
+
+                today = _date.today()
+                for role_def in NSM_MANIFEST:
+                    # Filter to candidates matching this role's categories within the age limit.
+                    role_candidates = []
+                    for c in all_candidates:
+                        cat = (c.category or "").strip()
+                        if cat not in role_def.nsm_categories:
+                            continue
+                        dt = self._parse_candidate_datetime(c.date_text)
+                        if dt == datetime.min.replace(tzinfo=UTC):
+                            continue
+                        age_months = (today.year - dt.year) * 12 + (today.month - dt.month)
+                        if age_months <= role_def.max_age_months:
+                            # Secondary sort key: prefer category that appears earlier in the list
+                            try:
+                                cat_priority = role_def.nsm_categories.index(cat)
+                            except ValueError:
+                                cat_priority = 99
+                            role_candidates.append((dt, cat_priority, c))
+
+                    if not role_candidates:
+                        result.notes.append(f"No candidate found for role '{role_def.role}'.")
+                        continue
+
+                    # Most recent first; among same date, prefer earlier category (iXBRL > PDF > HTML).
+                    role_candidates.sort(key=lambda t: (t[0], -t[1]), reverse=True)
+                    _, _, best = role_candidates[0]
+
+                    # Download it — use a role-specific stem so HTML files don't overwrite each other.
+                    doc = AcquiredDocument(
+                        role=role_def.role,
+                        title=best.title,
+                        date_text=best.date_text,
+                        category=best.category,
+                    )
+                    try:
+                        stem = f"nsm_{role_def.role}"
+                        if best.href:
+                            downloaded = self._download_candidate(
+                                page=page,
+                                candidate=best,
+                                download_dir=download_dir,
+                                filename_stem=stem,
+                            )
+                        else:
+                            downloaded = self._download_candidate_via_dialog(
+                                page=page,
+                                candidate=best,
+                                download_dir=download_dir,
+                            )
+                        if downloaded:
+                            _, primary, _ = self._prepare_downloaded_artifact(downloaded)
+                            doc.downloaded_file = str(downloaded)
+                            doc.primary_report_file = str(primary) if primary else None
+                            doc.notes.append(f"Downloaded: {downloaded.name}")
+                        else:
+                            doc.notes.append("No downloadable link.")
+                    except Exception as exc:
+                        doc.notes.append(f"Download failed: {exc}")
+
+                    result.documents.append(doc)
+
+            except PlaywrightTimeoutError as exc:
+                raise NSMSearchError(f"Timed out: {exc}") from exc
+            finally:
+                context.close()
+                browser.close()
+
+        return result
+
     @staticmethod
     def _is_data_migration_result(candidate: Optional[NSMCandidate]) -> bool:
         """Return True if the candidate href points to an old data-migration file."""
@@ -527,13 +678,19 @@ class NSMDownloadService:
 
         return best_candidate
 
-    def _download_candidate(self, page, candidate: NSMCandidate, download_dir: Path) -> Path:
+    def _download_candidate(
+        self,
+        page,
+        candidate: NSMCandidate,
+        download_dir: Path,
+        filename_stem: str = "nsm_document",
+    ) -> Path:
         href = candidate.href
         if not href:
             raise NSMSearchError("Selected candidate has no href.")
 
         if href.strip().lower().endswith(".pdf"):
-            return self._download_pdf(href, download_dir)
+            return self._download_pdf(href, download_dir, filename_stem)
 
         response = page.goto(href, wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
@@ -543,19 +700,22 @@ class NSMDownloadService:
             content_type = (response.header_value("content-type") or "").lower()
 
         if "application/pdf" in content_type:
-            return self._download_pdf(href, download_dir)
+            return self._download_pdf(href, download_dir, filename_stem)
 
-        target = download_dir / "nsm_document.html"
+        target = download_dir / f"{filename_stem}.html"
         target.write_text(page.content(), encoding="utf-8")
         return target
 
     @staticmethod
-    def _download_pdf(href: str, download_dir: Path) -> Path:
+    def _download_pdf(href: str, download_dir: Path, filename_stem: str = "nsm_document") -> Path:
         # Fetch directly rather than via browser to avoid PDF viewer interception.
         import httpx
-        filename = Path(href.split("/")[-1].split("?")[0]) or Path("nsm_document.pdf")
-        if not filename.suffix:
-            filename = Path("nsm_document.pdf")
+        url_filename = Path(href.split("/")[-1].split("?")[0])
+        # Preserve the server filename if unique (NI-XXXXX.pdf), otherwise use stem.
+        if url_filename.suffix and len(url_filename.stem) > 8:
+            filename = url_filename
+        else:
+            filename = Path(f"{filename_stem}.pdf")
         target = download_dir / filename
         with httpx.Client(follow_redirects=True, timeout=60) as client:
             response = client.get(href)
