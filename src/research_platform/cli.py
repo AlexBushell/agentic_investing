@@ -6,6 +6,14 @@ from typing import Optional
 
 import typer
 
+from research_platform.backup import (
+    BackupError,
+    CheckStatus,
+    RestoreMode,
+    run_backup,
+    run_restore_preflight,
+    run_restore,
+)
 from research_platform.core.config import get_settings
 from research_platform.core.logging import configure_logging, get_logger
 from research_platform.documents.ixbrl_extractor import (
@@ -125,6 +133,133 @@ def init_db() -> None:
     typer.echo(
         "Database initialization scaffold is ready.\n"
         f"DATABASE_URL={settings.database_url}"
+    )
+
+
+@app.command("backup")
+def backup_command(
+    target: Optional[Path] = typer.Option(
+        None,
+        help="Backup root directory. Defaults to BACKUP_TARGET_DIR from the environment.",
+    ),
+) -> None:
+    """Create a local backup snapshot with a pg_dump SQL export and copied data directory."""
+    settings = get_settings()
+    try:
+        result = run_backup(settings=settings, target_root=target, progress=typer.echo)
+    except BackupError as exc:
+        logger.error("Backup failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Backup created: {result.backup_dir}")
+    typer.echo(f"  Database dump: {result.db_dump_path}")
+    typer.echo(f"  Data copy: {result.data_copy_path}")
+    typer.echo(f"  Manifest: {result.manifest_path}")
+
+
+@app.command("restore")
+def restore_command(
+    backup_dir: Path = typer.Option(
+        ...,
+        "--from",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Path to a backup snapshot directory created by 'research backup'.",
+    ),
+    mode: RestoreMode = typer.Option(
+        RestoreMode.FULL,
+        help="Restore files only, database only, or both.",
+    ),
+    target_data_dir: Optional[Path] = typer.Option(
+        None,
+        help="Override DATA_DIR for the restore target.",
+    ),
+    target_db_url: Optional[str] = typer.Option(
+        None,
+        help="Override DATABASE_URL for the restore target.",
+    ),
+    apply: bool = typer.Option(
+        False,
+        help="Perform the restore. Without this flag the command runs as a dry-run plan only.",
+    ),
+    pre_backup: bool = typer.Option(
+        True,
+        "--pre-backup/--no-pre-backup",
+        help="Create a fresh safety backup before restoring.",
+    ),
+) -> None:
+    """Safely restore a backup snapshot with dry-run by default and typed confirmation on apply."""
+    settings = get_settings()
+    preflight = run_restore_preflight(
+        settings=settings,
+        backup_dir=backup_dir,
+        mode=mode,
+        target_data_dir=target_data_dir,
+        target_database_url=target_db_url,
+        create_pre_restore_backup=pre_backup,
+    )
+    plan = preflight.plan
+
+    typer.echo("Restore plan:")
+    typer.echo(f"  Backup: {plan.backup_dir if plan else backup_dir.resolve()}")
+    typer.echo(f"  Mode: {mode.value}")
+    typer.echo(f"  SQL dump: {plan.db_dump_path if plan and plan.db_dump_path else '(not used)'}")
+    typer.echo(f"  Backup data: {plan.data_copy_path if plan and plan.data_copy_path else '(not used)'}")
+    typer.echo(
+        f"  Target DB: {plan.target_database_url_redacted if plan and plan.target_database_url_redacted else '(not used)'}"
+    )
+    typer.echo(f"  Target data dir: {plan.target_data_dir if plan and plan.target_data_dir else '(not used)'}")
+    typer.echo(
+        f"  Pre-restore backup root: {plan.pre_restore_backup_root if plan and pre_backup else '(disabled)'}"
+    )
+
+    typer.echo("\nPreflight checklist:")
+    for check in preflight.checks:
+        typer.echo(f"  [{check.status.value}] {check.name}: {check.details}")
+
+    if not apply:
+        if not preflight.ok:
+            typer.echo("\nPreflight failed. Fix the failed items before running with --apply.")
+            raise typer.Exit(code=1)
+        typer.echo("\nDry run only. Re-run with --apply to execute the restore.")
+        return
+
+    if not preflight.ok:
+        typer.echo("\nRestore blocked because preflight failed.")
+        raise typer.Exit(code=1)
+
+    confirmation = typer.prompt("\nType RESTORE to continue")
+    if confirmation != "RESTORE":
+        typer.echo("Restore cancelled.")
+        raise typer.Exit(code=1)
+
+    try:
+        result = run_restore(
+            settings=settings,
+            backup_dir=backup_dir,
+            mode=mode,
+            target_data_dir=target_data_dir,
+            target_database_url=target_db_url,
+            create_pre_restore_backup=pre_backup,
+            progress=typer.echo,
+        )
+    except BackupError as exc:
+        logger.error("Restore failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("\nRestore complete:")
+    typer.echo(f"  Mode: {result.mode.value}")
+    typer.echo(f"  Source backup: {result.backup_dir}")
+    typer.echo(
+        f"  Pre-restore backup: {result.pre_restore_backup_dir if result.pre_restore_backup_dir else '(disabled)'}"
+    )
+    typer.echo(f"  Restored data dir: {result.target_data_dir if result.target_data_dir else '(not used)'}")
+    typer.echo(
+        f"  Previous data snapshot: {result.data_rollback_dir if result.data_rollback_dir else '(none)'}"
+    )
+    typer.echo(
+        f"  Restored DB: {result.target_database_url_redacted if result.target_database_url_redacted else '(not used)'}"
     )
 
 

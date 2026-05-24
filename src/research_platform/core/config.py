@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     data_dir: Path = Path("./data")
+    backup_target_dir: Path = Path("./backups")
+    backup_pg_dump_path: str = "pg_dump"
+    backup_psql_path: str = "psql"
     database_url: str = "postgresql+psycopg://postgres:change_me@localhost:5432/company_intelligence"
     pgvector_enabled: bool = True
     default_framework: str = "IVF_PRE_SCREEN"

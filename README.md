@@ -44,7 +44,10 @@ Key values to set in `.env`:
 | `LLM_MODEL` | e.g. `gemma4` for Ollama |
 | `OLLAMA_BASE_URL` | Default `http://localhost:11434` |
 | `OPENROUTER_API_KEY` | Required when using OpenRouter |
-| `DATABASE_URL` | PostgreSQL connection string (persistence not yet wired) |
+| `DATABASE_URL` | PostgreSQL connection string for local backup/restore and future persistence work |
+| `BACKUP_TARGET_DIR` | Default root directory for local backup snapshots |
+| `BACKUP_PG_DUMP_PATH` | Optional explicit path to `pg_dump` if it is not on `PATH` |
+| `BACKUP_PSQL_PATH` | Optional explicit path to `psql` if it is not on `PATH` |
 
 ### 5. Confirm the CLI works
 
@@ -61,6 +64,57 @@ research list-frameworks
 | `.env` | Deployment secrets — API keys, DB URL, model choice |
 | `config/nsm.yaml` | NSM site selectors and timeouts — versioned, update when FCA markup changes |
 | `config/framework_runner.yaml` | Per-framework LLM settings — temperature, repair attempts |
+
+---
+
+## Backup And Restore
+
+The project includes a local backup/restore workflow designed for a single-machine setup.
+
+### Create a backup
+
+```bash
+research backup
+research backup --target "G:\My Drive\company-intelligence-backups"
+```
+
+Each backup snapshot contains:
+- a PostgreSQL SQL dump created with `pg_dump`
+- a full copy of `DATA_DIR`
+- a small `manifest.json`
+
+Backups are stored in timestamped directories under `BACKUP_TARGET_DIR` by default.
+
+### Restore from a backup
+
+```bash
+# Dry run with checklist only
+research restore --from "G:\My Drive\company-intelligence-backups\20260524-123045"
+
+# Apply after preflight passes
+research restore --from "G:\My Drive\company-intelligence-backups\20260524-123045" --apply
+```
+
+Restore modes:
+- `--mode full`
+- `--mode files-only`
+- `--mode db-only`
+
+Safety defaults:
+- restore runs a preflight checklist before any live changes
+- `--apply` is blocked if preflight has any `FAIL` items
+- a pre-restore safety backup is created by default
+- file restore keeps a rollback copy of the previous `DATA_DIR`
+- database restore validates the dump in a temporary database before touching the live target
+
+Useful options:
+- `--target-data-dir` to restore files somewhere other than `DATA_DIR`
+- `--target-db-url` to restore into a different PostgreSQL database
+- `--no-pre-backup` to skip the safety backup if you explicitly want that
+
+Notes:
+- the PostgreSQL checks assume a local setup where the `postgres` maintenance database exists
+- temp-database validation requires a role that can create and drop databases
 
 ---
 
