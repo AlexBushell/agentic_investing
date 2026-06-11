@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from sqlalchemy.engine.url import make_url
 
 from research_platform.backup import (
     BackupError,
@@ -38,9 +39,17 @@ from research_platform.sources.nsm import (
 )
 from research_platform.sources.market import MarketDataError, YFinanceClient
 from research_platform.sources.openfigi import OpenFIGIClient, OpenFIGIError, to_yahoo_ticker
+from research_platform.store.models import STORE_TABLES
+from research_platform.store.session import run_migrations_to_head
 
 app = typer.Typer(help="Company intelligence platform CLI.")
 logger = get_logger(__name__)
+
+
+def _redact_database_url(database_url: str) -> str:
+    """Return a safe-to-print database URL with any password masked."""
+    url = make_url(database_url)
+    return url.render_as_string(hide_password=True)
 
 
 @app.callback()
@@ -128,12 +137,20 @@ def fetch_market_data(
 
 @app.command("init-db")
 def init_db() -> None:
-    """Show the configured database target for initial setup work."""
+    """Apply Alembic migrations for the core company store schema."""
     settings = get_settings()
-    typer.echo(
-        "Database initialization scaffold is ready.\n"
-        f"DATABASE_URL={settings.database_url}"
-    )
+    try:
+        run_migrations_to_head(settings)
+    except Exception as exc:
+        logger.error("Database initialization failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("Database initialized.")
+    typer.echo(f"DATABASE_URL={_redact_database_url(settings.database_url)}")
+    typer.echo("Migration target: head")
+    typer.echo("Expected core tables:")
+    for table_name in sorted(STORE_TABLES):
+        typer.echo(f"  - {table_name}")
 
 
 @app.command("backup")

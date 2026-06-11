@@ -1,12 +1,56 @@
-# Company Intelligence Platform
+# Company Intelligence Store
 
-A local-first company intelligence store and framework runner. The first working slice acquires annual reports and half-year results from the FCA National Storage Mechanism, parses iXBRL facts, and runs an LLM-powered IVF pre-screen.
+A local-first company data store for gathering, persisting, and exposing company context to downstream analytical frameworks and agents.
 
-**Current status:** end-to-end slice proven. Tesco PLC returns PASS_WITH_FLAGS / HIGH confidence from Gemma 4 via Ollama.
+The product in this repository is the `company context store`, not any single analysis framework. The current IVF pre-screen work is being treated as a test consumer of the store rather than the architectural center of the project.
 
-The full roadmap and next work are in [IVF_PreScreen_First_Slice_Roadmap.md](IVF_PreScreen_First_Slice_Roadmap.md).
+The current store-first blueprint lives in [docs/store_first_blueprint.md](docs/store_first_blueprint.md).
 
----
+## Current Focus
+
+The repository already has useful ingestion and extraction building blocks:
+
+- OpenFIGI-based identifier resolution
+- FCA NSM filing acquisition
+- iXBRL extraction and fact-set building
+- narrative text extraction for HTML and PDF documents
+- local backup and restore tooling
+
+The next major milestone is persistence:
+
+- define the canonical store schema
+- write ingestion outputs into the store
+- expose framework-neutral company context through an access layer
+
+## Repository Direction
+
+The long-term structure is:
+
+```text
+gather -> store -> access -> downstream consumers
+```
+
+Where:
+
+- `gather` acquires source data and artifacts
+- `store` persists canonical company data plus provenance
+- `access` provides neutral retrieval and context-building interfaces
+- downstream consumers such as IVF sit outside the core source tree
+
+## Current Layout
+
+Core source code lives in `src/research_platform/`.
+
+Key areas today:
+
+- `core/` for shared config and logging
+- `sources/` for external source adapters
+- `documents/` for parsing and extraction
+- `backup.py` for local store protection workflows
+- `store/` for persistence scaffolding
+- `access/` for framework-neutral context access scaffolding
+
+Experimental or downstream consumers should live outside the core tree under `labs/`.
 
 ## Local Setup
 
@@ -14,7 +58,7 @@ The full roadmap and next work are in [IVF_PreScreen_First_Slice_Roadmap.md](IVF
 
 ```bash
 python -m venv .venv
-source .venv/Scripts/activate   # Windows Git Bash
+source .venv/Scripts/activate
 # or on PowerShell: .\.venv\Scripts\Activate.ps1
 ```
 
@@ -36,40 +80,37 @@ python -m playwright install
 cp .env.example .env
 ```
 
-Key values to set in `.env`:
+Important values in `.env`:
 
 | Variable | Description |
 |---|---|
-| `LLM_PROVIDER` | `ollama` or `openrouter` |
-| `LLM_MODEL` | e.g. `gemma4` for Ollama |
-| `OLLAMA_BASE_URL` | Default `http://localhost:11434` |
-| `OPENROUTER_API_KEY` | Required when using OpenRouter |
-| `DATABASE_URL` | PostgreSQL connection string for local backup/restore and future persistence work |
-| `BACKUP_TARGET_DIR` | Default root directory for local backup snapshots |
-| `BACKUP_PG_DUMP_PATH` | Optional explicit path to `pg_dump` if it is not on `PATH` |
-| `BACKUP_PSQL_PATH` | Optional explicit path to `psql` if it is not on `PATH` |
+| `DATABASE_URL` | PostgreSQL connection string for the store |
+| `BACKUP_TARGET_DIR` | Root directory for local backup snapshots |
+| `BACKUP_PG_DUMP_PATH` | Optional explicit path to `pg_dump` |
+| `BACKUP_PSQL_PATH` | Optional explicit path to `psql` |
+| `OPENFIGI_API_KEY` | Optional API key for OpenFIGI |
+| `LLM_PROVIDER` | Still used by experimental framework consumers |
+| `LLM_MODEL` | Still used by experimental framework consumers |
 
 ### 5. Confirm the CLI works
 
 ```bash
-research list-frameworks
+research init-db
 ```
 
----
+`init-db` is still a scaffold today. The store schema implementation is the next major build step.
 
 ## Configuration
 
 | File | Purpose |
 |---|---|
-| `.env` | Deployment secrets — API keys, DB URL, model choice |
-| `config/nsm.yaml` | NSM site selectors and timeouts — versioned, update when FCA markup changes |
-| `config/framework_runner.yaml` | Per-framework LLM settings — temperature, repair attempts |
-
----
+| `.env` | Runtime configuration and secrets |
+| `config/nsm.yaml` | NSM selectors and timeouts |
+| `docs/store_first_blueprint.md` | Store-first architecture and refactor plan |
 
 ## Backup And Restore
 
-The project includes a local backup/restore workflow designed for a single-machine setup.
+The project includes a local backup and restore workflow designed to protect the company data store.
 
 ### Create a backup
 
@@ -78,113 +119,58 @@ research backup
 research backup --target "G:\My Drive\company-intelligence-backups"
 ```
 
-Each backup snapshot contains:
+Each snapshot contains:
+
 - a PostgreSQL SQL dump created with `pg_dump`
 - a full copy of `DATA_DIR`
 - a small `manifest.json`
 
-Backups are stored in timestamped directories under `BACKUP_TARGET_DIR` by default.
-
 ### Restore from a backup
 
 ```bash
-# Dry run with checklist only
 research restore --from "G:\My Drive\company-intelligence-backups\20260524-123045"
-
-# Apply after preflight passes
 research restore --from "G:\My Drive\company-intelligence-backups\20260524-123045" --apply
 ```
 
-Restore modes:
-- `--mode full`
-- `--mode files-only`
-- `--mode db-only`
-
 Safety defaults:
-- restore runs a preflight checklist before any live changes
+
+- restore runs a preflight checklist before live changes
 - `--apply` is blocked if preflight has any `FAIL` items
 - a pre-restore safety backup is created by default
 - file restore keeps a rollback copy of the previous `DATA_DIR`
-- database restore validates the dump in a temporary database before touching the live target
+- database restore validates the dump before touching the live target
 
-Useful options:
-- `--target-data-dir` to restore files somewhere other than `DATA_DIR`
-- `--target-db-url` to restore into a different PostgreSQL database
-- `--no-pre-backup` to skip the safety backup if you explicitly want that
+## Store-Oriented Commands Available Today
 
-Notes:
-- the PostgreSQL checks assume a local setup where the `postgres` maintenance database exists
-- temp-database validation requires a role that can create and drop databases
+The CLI still contains some legacy framework-oriented commands, but the store-relevant commands available now include:
 
----
+- `research lookup-isin`
+- `research ingest-nsm-report`
+- `research extract-text`
+- `research parse-xhtml-report`
+- `research extract-ixbrl-facts`
+- `research summarize-ixbrl`
+- `research fetch-market-data`
+- `research backup`
+- `research restore`
 
-## Full Pipeline
-
-### Acquire documents
-
-```bash
-# Annual report (XBRL package — most recent)
-research ingest-nsm-report --query "Tesco PLC" --document-type annual-report \
-  --out data/artifacts/nsm/tesco-plc/tesco_annual_meta.json
-
-# Half-year report (HTML RNS announcement or XBRL — most recent)
-research ingest-nsm-report --query "Tesco PLC" --document-type interim-report \
-  --out data/artifacts/nsm/tesco-plc/tesco_interim_meta.json
-```
-
-Add `--headed` to watch the browser and debug site changes.
-
-### Inspect the iXBRL facts
-
-```bash
-research extract-ixbrl-facts \
-  --file "data/downloads/nsm/tesco-plc/<annual-xhtml-path>" \
-  --out data/artifacts/nsm/tesco-plc/tesco_ixbrl.json
-
-research summarize-ixbrl \
-  --file "data/downloads/nsm/tesco-plc/<annual-xhtml-path>" \
-  --out data/artifacts/nsm/tesco-plc/tesco_fact_set.json
-```
-
-### Build the IVF packet
-
-```bash
-research build-ivf-packet-from-ixbrl \
-  --file "data/downloads/nsm/tesco-plc/<annual-xhtml-path>" \
-  --out data/artifacts/nsm/tesco-plc/tesco_ivf_packet.json
-```
-
-Pass `--post-period-file` with the path from the interim meta JSON to include the half-year update in the packet.
-
-### Run the IVF pre-screen
-
-```bash
-research run-ivf-pre-screen \
-  --packet-file data/artifacts/nsm/tesco-plc/tesco_ivf_packet.json \
-  --out data/artifacts/nsm/tesco-plc/tesco_ivf_result.json \
-  --prompt-out data/artifacts/nsm/tesco-plc/tesco_prompt.txt \
-  --raw-response-out data/artifacts/nsm/tesco-plc/tesco_raw_response.json
-```
-
-Requires a running Ollama instance (`ollama serve`) or a valid OpenRouter API key.
-
----
+These are transitional building blocks on the way to a store-first CLI.
 
 ## Running Tests
 
 ```bash
-# Unit tests only (no data files required)
 pytest tests/unit/
-
-# Integration tests (requires downloaded XHTML files in data/downloads/)
 pytest tests/integration/ -m integration
-
-# Regenerate golden files after intentional output changes
 python tests/integration/regenerate_goldens.py
 ```
 
----
+## Next Steps
 
-## Environment Strategy
+The next repo-level implementation steps are:
 
-One repo, one `.venv`, one `pyproject.toml`. Do not create separate virtual environments per subsystem. If separation is needed later, prefer dependency groups or optional extras.
+1. add the store schema and persistence layer
+2. write current ingestion outputs into the store
+3. expose a neutral company-context access layer
+4. move IVF-specific work into `labs/ivf_pre_screen/`
+
+That sequence keeps the useful ingestion work while making the store the durable product.
