@@ -226,33 +226,6 @@ class DocumentChunk(Base):
     )
 
 
-class MarketSnapshot(Base):
-    """Point-in-time market snapshot."""
-
-    __tablename__ = "market_snapshots"
-
-    snapshot_id: Mapped[uuid.UUID] = _uuid_pk()
-    company_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, ForeignKey("companies.company_id"), nullable=False, index=True
-    )
-    listing_id: Mapped[uuid.UUID | None] = mapped_column(
-        Uuid, ForeignKey("listings.listing_id")
-    )
-    source: Mapped[str] = mapped_column(String(64), nullable=False)
-    as_of_date: Mapped[date] = mapped_column(Date, nullable=False)
-    currency: Mapped[str | None] = mapped_column(String(16))
-    price: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
-    market_cap: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
-    enterprise_value: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
-    shares_outstanding: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
-    week_52_high: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
-    week_52_low: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
-    payload_json: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSONType)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-
-
 class IngestionRun(Base):
     """Operational audit trail for gather/store work."""
 

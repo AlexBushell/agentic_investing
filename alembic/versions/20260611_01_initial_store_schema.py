@@ -161,28 +161,6 @@ def upgrade() -> None:
     op.create_index("ix_narrative_extracts_extraction_id", "narrative_extracts", ["extraction_id"], unique=False)
 
     op.create_table(
-        "market_snapshots",
-        sa.Column("snapshot_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("company_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("listing_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("source", sa.String(length=64), nullable=False),
-        sa.Column("as_of_date", sa.Date(), nullable=False),
-        sa.Column("currency", sa.String(length=16), nullable=True),
-        sa.Column("price", sa.Numeric(precision=24, scale=6), nullable=True),
-        sa.Column("market_cap", sa.Numeric(precision=24, scale=6), nullable=True),
-        sa.Column("enterprise_value", sa.Numeric(precision=24, scale=6), nullable=True),
-        sa.Column("shares_outstanding", sa.Numeric(precision=24, scale=6), nullable=True),
-        sa.Column("week_52_high", sa.Numeric(precision=24, scale=6), nullable=True),
-        sa.Column("week_52_low", sa.Numeric(precision=24, scale=6), nullable=True),
-        sa.Column("payload_json", sa.JSON(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.ForeignKeyConstraint(["company_id"], ["companies.company_id"]),
-        sa.ForeignKeyConstraint(["listing_id"], ["listings.listing_id"]),
-        sa.PrimaryKeyConstraint("snapshot_id"),
-    )
-    op.create_index("ix_market_snapshots_company_id", "market_snapshots", ["company_id"], unique=False)
-
-    op.create_table(
         "ingestion_runs",
         sa.Column("ingestion_run_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("company_id", postgresql.UUID(as_uuid=True), nullable=True),
@@ -201,8 +179,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index("ix_ingestion_runs_company_id", table_name="ingestion_runs")
     op.drop_table("ingestion_runs")
-    op.drop_index("ix_market_snapshots_company_id", table_name="market_snapshots")
-    op.drop_table("market_snapshots")
     op.drop_index("ix_narrative_extracts_extraction_id", table_name="narrative_extracts")
     op.drop_index("ix_narrative_extracts_document_id", table_name="narrative_extracts")
     op.drop_index("ix_narrative_extracts_company_id", table_name="narrative_extracts")

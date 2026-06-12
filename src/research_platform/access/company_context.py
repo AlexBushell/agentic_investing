@@ -13,7 +13,6 @@ from research_platform.access.dto import (
     FactSet,
     IdentifierRecord,
     ListingRecord,
-    MarketSnapshot,
     NarrativeExtract,
     PassageRecord,
 )
@@ -58,7 +57,5 @@ class CompanyContextStore(Protocol):
         document_role: str | None = None,
         limit: int = 20,
     ) -> list[PassageRecord]: ...
-
-    def get_market_snapshot(self, company_id: str) -> MarketSnapshot | None: ...
 
     def build_company_context(self, company_ref: str) -> CompanyContextBundle: ...

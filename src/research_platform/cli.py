@@ -35,7 +35,6 @@ from research_platform.sources.nsm import (
     NSMDownloadService,
     NSMSearchError,
 )
-from research_platform.sources.market import MarketDataError, YFinanceClient
 from research_platform.sources.edgar import EdgarClient, EdgarError
 from research_platform.sources.gleif import GLEIFClient, GLEIFError
 from research_platform.sources.sec_tickers import SECTickerClient, SECTickerError
@@ -554,31 +553,6 @@ def extract_text_command(
             f"Stored text extraction: {persisted.extraction_id} "
             f"for document {persisted.document_id}"
         )
-
-
-@app.command("fetch-market-data")
-def fetch_market_data(
-    ticker: str = typer.Argument(..., help="Yahoo Finance ticker, e.g. TSCO.L"),
-    out: Optional[Path] = typer.Option(None, help="Optional path to write the result as JSON."),
-) -> None:
-    """Fetch current market snapshot and 4-year financial history from Yahoo Finance."""
-    client = YFinanceClient()
-    try:
-        snapshot, history = client.get_snapshot(ticker)
-    except MarketDataError as exc:
-        logger.error("Market data fetch failed: %s", exc)
-        raise typer.Exit(code=1) from exc
-
-    payload = {
-        "snapshot": snapshot.model_dump(mode="json"),
-        "history": history.model_dump(mode="json"),
-    }
-    typer.echo(json.dumps(payload, indent=2))
-
-    if out is not None:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        typer.echo(f"Wrote market data to {out}")
 
 
 @app.command("init-db")

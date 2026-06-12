@@ -18,7 +18,6 @@ from research_platform.access.dto import (
     FactSet,
     IdentifierRecord,
     ListingRecord,
-    MarketSnapshot,
     NarrativeExtract,
     PassageRecord,
 )
@@ -225,9 +224,6 @@ class SQLCompanyContextStore(CompanyContextStore):
             for item in items
         ]
 
-    def get_market_snapshot(self, company_id: str) -> MarketSnapshot | None:
-        return None
-
     def search_passages(
         self,
         company_id: str,
@@ -269,7 +265,6 @@ class SQLCompanyContextStore(CompanyContextStore):
             documents=self.get_latest_documents(company.company_id),
             facts=self.get_fact_set(company.company_id),
             narratives=self.get_narrative_extracts(company.company_id),
-            market_snapshot=self.get_market_snapshot(company.company_id),
         )
 
     def _resolve_company(self, company_ref: str) -> Company | None:

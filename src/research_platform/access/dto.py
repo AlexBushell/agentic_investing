@@ -104,15 +104,6 @@ class PassageRecord:
 
 
 @dataclass(slots=True)
-class MarketSnapshot:
-    """Framework-neutral market snapshot."""
-
-    as_of_date: str
-    price: float | None = None
-    market_cap: float | None = None
-
-
-@dataclass(slots=True)
 class CompanyContextBundle:
     """Composite bundle intended for downstream consumers."""
 
@@ -122,4 +113,3 @@ class CompanyContextBundle:
     documents: list[DocumentRecord] = field(default_factory=list)
     facts: FactSet = field(default_factory=FactSet)
     narratives: list[NarrativeExtract] = field(default_factory=list)
-    market_snapshot: MarketSnapshot | None = None
