@@ -9,15 +9,17 @@ from typer.testing import CliRunner
 
 from research_platform.access.dto import CompanyRecord
 from research_platform.cli import (
-    ResolvedCompanyCandidate,
     app,
     _choose_company_candidate,
     _normalize_document_roles,
     _rank_uk_candidates,
-    _select_documents_for_derivation,
 )
 from research_platform.core.config import Settings
 from research_platform.sources.gleif import GLEIFRecord
+from research_platform.store.services.company_context_builder import (
+    ResolvedCompanyCandidate,
+    _select_documents_for_derivation,
+)
 
 
 runner = CliRunner()
@@ -156,8 +158,8 @@ def test_derive_company_context_returns_derived_and_skipped_documents():
     with (
         patch("research_platform.cli.get_settings", return_value=settings),
         patch("research_platform.cli.session_scope", _fake_session_scope),
-        patch("research_platform.cli.SQLCompanyContextStore", return_value=_Store()),
-        patch("research_platform.cli.DocumentPipelineService", _Pipeline),
+        patch("research_platform.store.services.company_context_builder.SQLCompanyContextStore", return_value=_Store()),
+        patch("research_platform.store.services.company_context_builder.DocumentPipelineService", _Pipeline),
     ):
         result = runner.invoke(
             app,
@@ -282,10 +284,10 @@ def test_build_company_context_uses_prompted_selection_and_runs_us_flow():
         patch("research_platform.cli._resolve_company_candidates", return_value=candidates),
         patch("research_platform.cli.typer.prompt", return_value=2),
         patch("research_platform.cli.session_scope", _fake_session_scope),
-        patch("research_platform.cli.SQLCompanyContextStore", return_value=_Store()),
-        patch("research_platform.cli.DocumentPipelineService", _Pipeline),
-        patch("research_platform.cli.EdgarClient", _EdgarClient),
-        patch("research_platform.cli.EdgarIngestionService", _EdgarIngestionService),
+        patch("research_platform.store.services.company_context_builder.SQLCompanyContextStore", return_value=_Store()),
+        patch("research_platform.store.services.company_context_builder.DocumentPipelineService", _Pipeline),
+        patch("research_platform.store.services.company_context_builder.EdgarClient", _EdgarClient),
+        patch("research_platform.store.services.company_context_builder.EdgarIngestionService", _EdgarIngestionService),
     ):
         result = runner.invoke(app, ["build-company-context", "Inmode"])
 

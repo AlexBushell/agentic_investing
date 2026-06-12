@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -47,18 +46,14 @@ from research_platform.store.services.document_pipeline import DocumentPipelineS
 from research_platform.store.services.document_ingestion import DocumentIngestionService
 from research_platform.store.services.edgar_ingestion import EdgarIngestionService
 from research_platform.store.services.extraction_persistence import ExtractionPersistenceService
+from research_platform.store.services.company_context_builder import (
+    CompanyContextBuilderService,
+    ResolvedCompanyCandidate,
+)
 from research_platform.store.session import run_migrations_to_head, session_scope
 
 app = typer.Typer(help="Company intelligence platform CLI.")
 logger = get_logger(__name__)
-
-
-@dataclass(slots=True)
-class ResolvedCompanyCandidate:
-    market: str
-    display_name: str
-    summary: str
-    payload: dict[str, object]
 
 
 def _redact_database_url(database_url: str) -> str:
@@ -357,35 +352,6 @@ def _choose_company_candidate(
     if chosen < 1 or chosen > len(candidates):
         raise typer.BadParameter(f"Selection must be between 1 and {len(candidates)}.")
     return candidates[chosen - 1]
-
-
-def _select_documents_for_derivation(
-    *,
-    documents,
-    document_roles: set[str],
-    latest_only: bool,
-    limit: int | None,
-):
-    selected = [
-        document
-        for document in documents
-        if not document_roles or document.document_role in document_roles
-    ]
-
-    if latest_only:
-        seen_roles: set[str] = set()
-        latest = []
-        for document in selected:
-            if document.document_role in seen_roles:
-                continue
-            seen_roles.add(document.document_role)
-            latest.append(document)
-        selected = latest
-
-    if limit is not None:
-        selected = selected[:limit]
-
-    return selected
 
 
 @app.callback()
@@ -1027,68 +993,17 @@ def derive_company_context(
     normalized_roles = _normalize_document_roles(document_role)
     try:
         with session_scope(settings) as session:
-            store = SQLCompanyContextStore(session)
-            company_record = store.get_company(company)
-            documents = store.get_latest_documents(company_record.company_id)
-            selected_documents = _select_documents_for_derivation(
-                documents=documents,
+            derivation = CompanyContextBuilderService(session, settings).derive(
+                company_ref=company,
                 document_roles=normalized_roles,
                 latest_only=latest_only,
                 limit=limit,
+                strategy=strategy,
+                chunk=chunk,
+                max_chars=max_chars,
+                overlap_chars=overlap_chars,
             )
-
-            pipeline = DocumentPipelineService(session)
-            derived = []
-            skipped = []
-            for document_record in selected_documents:
-                try:
-                    result = pipeline.materialize_document(
-                        document_id=document_record.document_id,
-                        strategy=strategy,
-                        chunk=chunk,
-                        max_chars=max_chars,
-                        overlap_chars=overlap_chars,
-                    )
-                except Exception as exc:
-                    skipped.append(
-                        {
-                            "document_id": document_record.document_id,
-                            "document_role": document_record.document_role,
-                            "title": document_record.title,
-                            "reason": str(exc),
-                        }
-                    )
-                    continue
-
-                derived.append(
-                    {
-                        "document_id": result.document_id,
-                        "document_role": document_record.document_role,
-                        "title": document_record.title,
-                        "artifact_id": result.artifact_id,
-                        "artifact_path": result.artifact_path,
-                        "strategy": result.strategy,
-                        "extraction_id": result.extraction_id,
-                        "fact_count": result.fact_count,
-                        "narrative_count": result.narrative_count,
-                        "chunk_count": result.chunk_count,
-                    }
-                )
-
-            payload = {
-                "company": asdict(company_record),
-                "filters": {
-                    "document_roles": sorted(normalized_roles) if normalized_roles else [],
-                    "latest_only": latest_only,
-                    "limit": limit,
-                    "strategy": strategy,
-                    "chunk": chunk,
-                },
-                "selected_document_count": len(selected_documents),
-                "derived_document_count": len(derived),
-                "derived_documents": derived,
-                "skipped_documents": skipped,
-            }
+            payload = asdict(derivation)
     except Exception as exc:
         logger.error("Company context derivation failed: %s", exc)
         raise typer.Exit(code=1) from exc
@@ -1170,149 +1085,21 @@ def build_company_context(
         logger.error("Company resolution failed: %s", exc)
         raise typer.Exit(code=1) from exc
 
-    ingestion_summary: dict[str, object]
-    derived_payload: dict[str, object]
-
     try:
         with session_scope(settings) as session:
-            if chosen.market == "uk":
-                lei = str(chosen.payload["lei"])
-                gleif_client = GLEIFClient()
-                gleif_record = gleif_client.get_record(lei)
-                gleif_record.isins = gleif_client.get_isins(lei)
-
-                result = NSMDownloadService(settings=settings).run(
-                    NSMDownloadRequest(
-                        query=gleif_record.legal_name,
-                        document_type=uk_document_type,
-                        headed=False,
-                        browser_channel=None,
-                        max_results=10,
-                    )
-                )
-
-                gleif_write = CompanyIdentityService(session).upsert_from_gleif(record=gleif_record)
-                write_result = DocumentIngestionService(session).persist_nsm_download_result(
-                    query=gleif_record.legal_name,
-                    result=result,
-                    company_id=gleif_write.company_id,
-                )
-                target_company_ref = gleif_write.company_id
-                ingestion_summary = {
-                    "market": "uk",
-                    "selected_company": {
-                        "display_name": chosen.display_name,
-                        "summary": chosen.summary,
-                        "lei": lei,
-                    },
-                    "ingested_documents": [write_result.document_id],
-                    "document_type": uk_document_type,
-                }
-            else:
-                cik = str(chosen.payload["cik"])
-                filer_profile = chosen.payload.get("edgar_profile", {})
-                suggested_forms = filer_profile.get("suggested_forms") or [
-                    "10-K",
-                    "10-Q",
-                    "8-K",
-                    "20-F",
-                    "6-K",
-                ]
-                forms_csv = us_forms or ",".join(suggested_forms)
-                form_list = tuple(item.strip().upper() for item in forms_csv.split(",") if item.strip())
-
-                edgar_client = EdgarClient(settings)
-                submissions = edgar_client.discover_filings(cik=cik, forms=form_list, limit=us_limit)
-                downloaded_files: dict[str, Path] = {}
-                if download:
-                    for filing in submissions.filings:
-                        try:
-                            downloaded_files[filing.accession_number] = edgar_client.download_filing(filing)
-                        except EdgarError as exc:
-                            logger.warning(
-                                "EDGAR download failed for %s: %s",
-                                filing.accession_number,
-                                exc,
-                            )
-
-                persisted = EdgarIngestionService(session).persist_submissions(
-                    submissions=submissions,
-                    downloaded_files=downloaded_files or None,
-                )
-                target_company_ref = persisted.company_id
-                ingestion_summary = {
-                    "market": "us",
-                    "selected_company": {
-                        "display_name": chosen.display_name,
-                        "summary": chosen.summary,
-                        "cik": cik,
-                    },
-                    "ingested_documents": persisted.document_ids,
-                    "forms": list(form_list),
-                    "filing_count": len(submissions.filings),
-                }
-
-            store = SQLCompanyContextStore(session)
-            company_record = store.get_company(target_company_ref)
-            documents = store.get_latest_documents(company_record.company_id)
-            selected_documents = _select_documents_for_derivation(
-                documents=documents,
-                document_roles=set(),
-                latest_only=derive_latest_only,
-                limit=derive_limit,
+            build_result = CompanyContextBuilderService(session, settings).build(
+                chosen=chosen,
+                uk_document_type=uk_document_type,
+                us_forms=us_forms,
+                us_limit=us_limit,
+                download=download,
+                derive_latest_only=derive_latest_only,
+                derive_limit=derive_limit,
+                strategy=strategy,
+                chunk=chunk,
+                max_chars=max_chars,
+                overlap_chars=overlap_chars,
             )
-
-            pipeline = DocumentPipelineService(session)
-            derived = []
-            skipped = []
-            for document_record in selected_documents:
-                try:
-                    result = pipeline.materialize_document(
-                        document_id=document_record.document_id,
-                        strategy=strategy,
-                        chunk=chunk,
-                        max_chars=max_chars,
-                        overlap_chars=overlap_chars,
-                    )
-                except Exception as exc:
-                    skipped.append(
-                        {
-                            "document_id": document_record.document_id,
-                            "document_role": document_record.document_role,
-                            "title": document_record.title,
-                            "reason": str(exc),
-                        }
-                    )
-                    continue
-
-                derived.append(
-                    {
-                        "document_id": result.document_id,
-                        "document_role": document_record.document_role,
-                        "title": document_record.title,
-                        "artifact_id": result.artifact_id,
-                        "artifact_path": result.artifact_path,
-                        "strategy": result.strategy,
-                        "extraction_id": result.extraction_id,
-                        "fact_count": result.fact_count,
-                        "narrative_count": result.narrative_count,
-                        "chunk_count": result.chunk_count,
-                    }
-                )
-
-            derived_payload = {
-                "company": asdict(company_record),
-                "selected_document_count": len(selected_documents),
-                "derived_document_count": len(derived),
-                "derived_documents": derived,
-                "skipped_documents": skipped,
-                "filters": {
-                    "latest_only": derive_latest_only,
-                    "limit": derive_limit,
-                    "strategy": strategy,
-                    "chunk": chunk,
-                },
-            }
     except Exception as exc:
         logger.error("Company context build failed: %s", exc)
         raise typer.Exit(code=1) from exc
@@ -1325,8 +1112,8 @@ def build_company_context(
             "summary": chosen.summary,
             "payload": chosen.payload,
         },
-        "ingestion": ingestion_summary,
-        "derived_company_context": derived_payload,
+        "ingestion": build_result.ingestion_summary,
+        "derived_company_context": asdict(build_result.derived_context),
     }
     typer.echo(json.dumps(payload, indent=2))
 
