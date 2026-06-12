@@ -2,25 +2,21 @@
 
 A local-first company data store for gathering, persisting, and exposing company context to downstream analytical frameworks and agents.
 
-The product in this repository is the `company context store`, not any single analysis framework. The current IVF pre-screen work is being treated as a test consumer of the store rather than the architectural center of the project.
+This repository's job is the `company context store` itself — gathering, storing, and serving company data through a stable `access` layer. Analytical frameworks (e.g. the Intrinsic Value Framework pre-screen) are external consumers that live in their own repositories and integrate against `access`; none of that framework-specific logic lives here.
 
 The current store-first blueprint lives in [docs/store_first_blueprint.md](docs/store_first_blueprint.md).
 
 ## Current Focus
 
-The repository already has useful ingestion and extraction building blocks:
+The store already supports:
 
-- OpenFIGI-based identifier resolution
-- FCA NSM filing acquisition
-- iXBRL extraction and fact-set building
-- narrative text extraction for HTML and PDF documents
+- company identity persistence from GLEIF (UK) and SEC/EDGAR (US)
+- EDGAR and NSM document persistence
+- structured fact and narrative extraction persistence
+- chunking and passage retrieval for downstream consumers
 - local backup and restore tooling
 
-The next major milestone is persistence:
-
-- define the canonical store schema
-- write ingestion outputs into the store
-- expose framework-neutral company context through an access layer
+The main near-term focus is broadening ingestion coverage and making store access more ergonomic for agentic consumers.
 
 ## Repository Direction
 
@@ -35,7 +31,7 @@ Where:
 - `gather` acquires source data and artifacts
 - `store` persists canonical company data plus provenance
 - `access` provides neutral retrieval and context-building interfaces
-- downstream consumers such as IVF sit outside the core source tree
+- downstream consumers integrate against `access` from their own repositories
 
 ## Current Layout
 
@@ -47,10 +43,8 @@ Key areas today:
 - `sources/` for external source adapters
 - `documents/` for parsing and extraction
 - `backup.py` for local store protection workflows
-- `store/` for persistence scaffolding
-- `access/` for framework-neutral context access scaffolding
-
-Experimental or downstream consumers should live outside the core tree under `labs/`.
+- `store/` for persistence and provenance
+- `access/` for framework-neutral context retrieval
 
 ## Local Setup
 
@@ -88,9 +82,6 @@ Important values in `.env`:
 | `BACKUP_TARGET_DIR` | Root directory for local backup snapshots |
 | `BACKUP_PG_DUMP_PATH` | Optional explicit path to `pg_dump` |
 | `BACKUP_PSQL_PATH` | Optional explicit path to `psql` |
-| `OPENFIGI_API_KEY` | Optional API key for OpenFIGI |
-| `LLM_PROVIDER` | Still used by experimental framework consumers |
-| `LLM_MODEL` | Still used by experimental framework consumers |
 
 ### 5. Confirm the CLI works
 
@@ -98,7 +89,7 @@ Important values in `.env`:
 research init-db
 ```
 
-`init-db` is still a scaffold today. The store schema implementation is the next major build step.
+`init-db` applies the current Alembic migrations for the company data store.
 
 ## Configuration
 
@@ -142,19 +133,30 @@ Safety defaults:
 
 ## Store-Oriented Commands Available Today
 
-The CLI still contains some legacy framework-oriented commands, but the store-relevant commands available now include:
+The core `research` CLI is centered on the company data store. Key commands include:
 
-- `research lookup-isin`
+- `research resolve-company`
+- `research build-company-context`
+- `research find-uk-company`
+- `research find-us-company`
 - `research ingest-nsm-report`
+- `research ingest-nsm-company`
+- `research ingest-edgar-filings`
 - `research extract-text`
 - `research parse-xhtml-report`
 - `research extract-ixbrl-facts`
-- `research summarize-ixbrl`
-- `research fetch-market-data`
+- `research show-company`
+- `research list-documents`
+- `research list-artifacts`
+- `research show-document`
+- `research show-artifact`
+- `research show-facts`
+- `research derive-document-context`
+- `research derive-company-context`
+- `research chunk-document`
+- `research search-passages`
 - `research backup`
 - `research restore`
-
-These are transitional building blocks on the way to a store-first CLI.
 
 ## Running Tests
 
@@ -168,9 +170,7 @@ python tests/integration/regenerate_goldens.py
 
 The next repo-level implementation steps are:
 
-1. add the store schema and persistence layer
-2. write current ingestion outputs into the store
-3. expose a neutral company-context access layer
-4. move IVF-specific work into `labs/ivf_pre_screen/`
-
-That sequence keeps the useful ingestion work while making the store the durable product.
+1. add batch ingestion workflows for EDGAR and NSM
+2. improve retrieval ergonomics for downstream agents
+3. add vector-backed passage retrieval when needed
+4. document and stabilize the `access` layer contract for external framework consumers

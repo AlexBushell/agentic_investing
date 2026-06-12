@@ -17,20 +17,7 @@ class Settings(BaseSettings):
     backup_psql_path: str = "psql"
     database_url: str = "postgresql+psycopg://postgres:change_me@localhost:5432/company_intelligence"
     pgvector_enabled: bool = True
-    default_framework: str = "IVF_PRE_SCREEN"
     default_exchange: str = "LSE"
-    llm_provider: str = "ollama"
-    llm_model: str = "qwen3:14b"
-    llm_timeout_seconds: int = 120
-    ollama_base_url: str = "http://localhost:11434"
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_api_key: str = ""
-    openrouter_http_referer: str | None = None
-    openrouter_app_title: str = "company-intelligence-platform"
-    openfigi_api_key: str = ""
-    framework_runner_config_path: Path = Path("./config/framework_runner.yaml")
-    ivf_pre_screen_temperature: float = 0.1
-    ivf_pre_screen_max_repair_attempts: int = 1
     nsm_config_path: Path = Path("./config/nsm.yaml")
     nsm_base_url: str = "https://data.fca.org.uk/#/nsm/nationalstoragemechanism"
     nsm_download_dir: Path = Path("./data/downloads/nsm")
@@ -60,7 +47,13 @@ class Settings(BaseSettings):
     nsm_result_category_selector: str = "td[data-before='Category'] summary"
     nsm_result_link_selector: str = "td[data-before='Description'] a[href]"
     nsm_download_dialog_selector: str = "#dialog4"
-    nsm_download_button_selector: str = "#focus4"
+    nsm_download_button_selector: str = "#downloadMenu"
+    sec_user_agent: str = "company-intelligence-store admin@example.com"
+    sec_company_tickers_url: str = "https://www.sec.gov/files/company_tickers.json"
+    sec_data_base_url: str = "https://data.sec.gov"
+    sec_archives_base_url: str = "https://www.sec.gov/Archives"
+    sec_download_dir: Path = Path("./data/downloads/edgar")
+    sec_artifact_dir: Path = Path("./data/artifacts/edgar")
     browser_channel: str | None = Field(
         default=None,
         description="Optional Playwright browser channel such as chrome or msedge.",
@@ -76,30 +69,8 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     settings = Settings()
-    _apply_framework_runner_yaml_defaults(settings)
     _apply_nsm_yaml_defaults(settings)
     return settings
-
-
-def _apply_framework_runner_yaml_defaults(settings: Settings) -> None:
-    config_path = settings.framework_runner_config_path
-    if not config_path.exists():
-        return
-
-    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    if not isinstance(payload, dict):
-        return
-
-    ivf_config = payload.get("ivf_pre_screen")
-    if not isinstance(ivf_config, dict):
-        return
-
-    _set_if_default(settings, "ivf_pre_screen_temperature", ivf_config.get("temperature"))
-    _set_if_default(
-        settings,
-        "ivf_pre_screen_max_repair_attempts",
-        ivf_config.get("max_repair_attempts"),
-    )
 
 
 def _apply_nsm_yaml_defaults(settings: Settings) -> None:

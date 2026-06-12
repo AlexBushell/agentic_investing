@@ -7,7 +7,7 @@ from research_platform.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-_SUPPORTED = {".pdf", ".html", ".htm"}
+_SUPPORTED = {".pdf", ".html", ".htm", ".xhtml"}
 
 try:
     import pymupdf4llm

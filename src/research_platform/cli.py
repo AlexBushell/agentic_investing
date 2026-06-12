@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -15,13 +17,13 @@ from research_platform.backup import (
     run_restore_preflight,
     run_restore,
 )
+from research_platform.access.queries import SQLCompanyContextStore
 from research_platform.core.config import get_settings
 from research_platform.core.logging import configure_logging, get_logger
 from research_platform.documents.ixbrl_extractor import (
     IXBRLExtractionError,
     IXBRLExtractor,
 )
-from research_platform.documents.ivf_ixbrl_packet import IVFFIXBRLPacketBuilder
 from research_platform.documents.text_extractor import TextExtractionError, extract_text
 from research_platform.documents.ixbrl_summary import IXBRLFactSetBuilder
 from research_platform.documents.xhtml_markdown import XHTMLMarkdownRenderer
@@ -29,21 +31,34 @@ from research_platform.documents.xhtml_parser import (
     XHTMLReportParseError,
     XHTMLReportParser,
 )
-from research_platform.frameworks.ivf_pre_screen import IVFPreScreenRunner
-from research_platform.frameworks.registry import load_framework_registry
-from research_platform.llm import create_llm_client
 from research_platform.sources.nsm import (
     NSMDownloadRequest,
     NSMDownloadService,
     NSMSearchError,
 )
 from research_platform.sources.market import MarketDataError, YFinanceClient
-from research_platform.sources.openfigi import OpenFIGIClient, OpenFIGIError, to_yahoo_ticker
+from research_platform.sources.edgar import EdgarClient, EdgarError
+from research_platform.sources.gleif import GLEIFClient, GLEIFError
+from research_platform.sources.sec_tickers import SECTickerClient, SECTickerError
 from research_platform.store.models import STORE_TABLES
-from research_platform.store.session import run_migrations_to_head
+from research_platform.store.services.company_identity import CompanyIdentityService
+from research_platform.store.services.chunking import NarrativeChunkingService
+from research_platform.store.services.document_pipeline import DocumentPipelineService
+from research_platform.store.services.document_ingestion import DocumentIngestionService
+from research_platform.store.services.edgar_ingestion import EdgarIngestionService
+from research_platform.store.services.extraction_persistence import ExtractionPersistenceService
+from research_platform.store.session import run_migrations_to_head, session_scope
 
 app = typer.Typer(help="Company intelligence platform CLI.")
 logger = get_logger(__name__)
+
+
+@dataclass(slots=True)
+class ResolvedCompanyCandidate:
+    market: str
+    display_name: str
+    summary: str
+    payload: dict[str, object]
 
 
 def _redact_database_url(database_url: str) -> str:
@@ -52,40 +67,479 @@ def _redact_database_url(database_url: str) -> str:
     return url.render_as_string(hide_password=True)
 
 
+def _build_uk_candidate_list(results) -> list[dict[str, object]]:
+    return [
+        {
+            "lei": result.lei,
+            "legal_name": result.legal_name,
+            "country": result.country,
+            "jurisdiction": result.jurisdiction,
+            "city": result.city,
+            "registered_as": result.registered_as,
+            "status": result.status,
+            "registration_status": result.registration_status,
+            "isins": result.isins,
+            "other_names": result.other_names,
+            "next_commands": _build_uk_next_commands(lei=result.lei),
+        }
+        for result in results
+    ]
+
+
+def _rank_uk_candidates(*, query: str, results):
+    normalized_query = _normalize_name_for_ranking(query)
+
+    def score(record) -> tuple[int, int, int, int, int, str]:
+        normalized_name = _normalize_name_for_ranking(record.legal_name)
+        exact_score = 2 if normalized_name == normalized_query else 0
+        substring_score = 1 if normalized_query and normalized_query in normalized_name else 0
+        isin_score = 4 if record.isins else 0
+        plc_score = 1 if " plc" in f" {record.legal_name.lower()} " else 0
+        penalty = 0
+        lowered = record.legal_name.lower()
+        if "plan" in lowered or "trust" in lowered or "incentive" in lowered:
+            penalty -= 2
+        if "limited" in lowered and "plc" not in lowered:
+            penalty -= 1
+        return (
+            isin_score,
+            exact_score,
+            substring_score,
+            plc_score + penalty,
+            len(record.isins),
+            record.legal_name,
+        )
+
+    return sorted(results, key=score, reverse=True)
+
+
+def _normalize_name_for_ranking(value: str) -> str:
+    cleaned = "".join(character.lower() if character.isalnum() else " " for character in value)
+    stop_words = {"the", "plc", "limited", "ltd", "corp", "inc", "company", "co"}
+    tokens = [token for token in cleaned.split() if token and token not in stop_words]
+    return " ".join(tokens)
+
+
+def _build_uk_next_commands(*, lei: str) -> list[dict[str, str]]:
+    return [
+        {
+            "purpose": "Retrieve the latest annual report from FCA NSM",
+            "command": f"research ingest-nsm-company --lei {lei} --document-type annual-report --no-persist",
+        },
+        {
+            "purpose": "Retrieve the latest interim report from FCA NSM",
+            "command": f"research ingest-nsm-company --lei {lei} --document-type interim-report --no-persist",
+        },
+    ]
+
+
+def _build_us_next_commands(*, cik: str, forms: list[str]) -> list[dict[str, str]]:
+    form_csv = ",".join(forms)
+    return [
+        {
+            "purpose": "Retrieve recent EDGAR filings using the suggested form family",
+            "command": (
+                "research ingest-edgar-filings "
+                f"--cik {cik} --forms {form_csv} --limit 10 --download --no-persist"
+            ),
+        }
+    ]
+
+
+def _build_us_candidate_list(results, *, profiles_by_cik: dict[str, dict[str, object]] | None = None) -> list[dict[str, object]]:
+    profiles_by_cik = profiles_by_cik or {}
+    candidates: list[dict[str, object]] = []
+    for result in results:
+        candidate = {
+            "cik": result.cik,
+            "ticker": result.ticker,
+            "title": result.title,
+        }
+        profile = profiles_by_cik.get(result.cik)
+        if profile:
+            candidate["edgar_profile"] = profile
+            candidate["next_commands"] = _build_us_next_commands(
+                cik=result.cik,
+                forms=profile["suggested_forms"],
+            )
+        else:
+            candidate["next_commands"] = _build_us_next_commands(
+                cik=result.cik,
+                forms=["10-K", "10-Q", "8-K", "20-F", "6-K"],
+            )
+        candidates.append(candidate)
+    return candidates
+
+
+def _build_us_resolver_payload(
+    *,
+    query: str,
+    results,
+    profiles_by_cik: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "query": query,
+        "candidate_count": len(results),
+        "candidates": _build_us_candidate_list(results, profiles_by_cik=profiles_by_cik),
+    }
+
+
+def _build_us_profiles(settings, results) -> dict[str, dict[str, object]]:
+    client = EdgarClient(settings)
+    profiles: dict[str, dict[str, object]] = {}
+    for result in results:
+        try:
+            profile = client.inspect_filer(cik=result.cik)
+        except EdgarError:
+            continue
+        profiles[result.cik] = profile.model_dump(mode="json")
+    return profiles
+
+
+def _forms_match_filing_family(*, requested_forms: tuple[str, ...], suggested_forms: list[str]) -> bool:
+    requested = {form.strip().upper() for form in requested_forms if form}
+    suggested = {form.strip().upper() for form in suggested_forms if form}
+    if not requested or not suggested:
+        return True
+    return requested.issubset(suggested)
+
+
+def _build_edgar_form_guidance(*, cik: str, requested_forms: tuple[str, ...], filer_profile) -> dict[str, object]:
+    requested = [form.strip().upper() for form in requested_forms if form.strip()]
+    suggested = filer_profile.suggested_forms
+    forms_match = _forms_match_filing_family(
+        requested_forms=requested_forms,
+        suggested_forms=suggested,
+    )
+    return {
+        "cik": filer_profile.cik,
+        "company_name": filer_profile.company_name,
+        "entity_type": filer_profile.entity_type,
+        "filing_family": filer_profile.filing_family,
+        "requested_forms": requested,
+        "suggested_forms": suggested,
+        "forms_match": forms_match,
+        "suggested_command": (
+            "research ingest-edgar-filings "
+            f"--cik {cik} --forms {','.join(suggested)} --limit 10 --download --no-persist"
+        ),
+    }
+
+
+def _derive_document_context(
+    *,
+    session,
+    document_id: str,
+    max_chars: int = 1200,
+    overlap_chars: int = 150,
+) -> dict[str, object]:
+    result = DocumentPipelineService(session).materialize_document(
+        document_id=document_id,
+        strategy="auto",
+        chunk=True,
+        max_chars=max_chars,
+        overlap_chars=overlap_chars,
+    )
+    return {
+        "document_id": result.document_id,
+        "artifact_id": result.artifact_id,
+        "artifact_path": result.artifact_path,
+        "strategy": result.strategy,
+        "extraction_id": result.extraction_id,
+        "fact_count": result.fact_count,
+        "narrative_count": result.narrative_count,
+        "chunk_count": result.chunk_count,
+    }
+
+
+def _normalize_document_roles(document_roles: list[str] | None) -> set[str]:
+    if not document_roles:
+        return set()
+    return {
+        item.strip().upper().replace("-", "_")
+        for item in document_roles
+        if item and item.strip()
+    }
+
+
+def _resolve_company_candidates(
+    *,
+    name: str,
+    market: str,
+    limit: int,
+    settings,
+) -> list[ResolvedCompanyCandidate]:
+    candidates: list[ResolvedCompanyCandidate] = []
+    selected = market.strip().lower()
+
+    if selected in {"auto", "uk"}:
+        uk_client = GLEIFClient()
+        try:
+            uk_results = uk_client.search_company(name, country="GB", limit=limit)
+        except GLEIFError:
+            uk_results = []
+        else:
+            for result in uk_results:
+                result.isins = uk_client.get_isins(result.lei)
+            uk_results = _rank_uk_candidates(query=name, results=uk_results)
+        for result in uk_results:
+            isins = ", ".join(result.isins) if result.isins else "none"
+            candidates.append(
+                ResolvedCompanyCandidate(
+                    market="uk",
+                    display_name=result.legal_name,
+                    summary=f"UK | LEI {result.lei} | ISINs {isins}",
+                    payload={
+                        "lei": result.lei,
+                        "legal_name": result.legal_name,
+                        "country": result.country,
+                        "isins": result.isins,
+                    },
+                )
+            )
+
+    if selected in {"auto", "us"}:
+        us_client = SECTickerClient(settings)
+        try:
+            us_results = us_client.search_company(name, limit=limit)
+        except SECTickerError:
+            us_results = []
+            us_profiles_by_cik = {}
+        else:
+            us_profiles_by_cik = _build_us_profiles(settings, us_results)
+        for result in us_results:
+            profile = us_profiles_by_cik.get(result.cik, {})
+            filing_family = profile.get("filing_family", "unknown")
+            suggested_forms = ",".join(profile.get("suggested_forms", [])) or "10-K,10-Q,8-K,20-F,6-K"
+            candidates.append(
+                ResolvedCompanyCandidate(
+                    market="us",
+                    display_name=result.title,
+                    summary=(
+                        f"US | CIK {result.cik} | ticker {result.ticker} | "
+                        f"{filing_family} | forms {suggested_forms}"
+                    ),
+                    payload={
+                        "cik": result.cik,
+                        "ticker": result.ticker,
+                        "title": result.title,
+                        "edgar_profile": profile,
+                    },
+                )
+            )
+
+    return candidates
+
+
+def _choose_company_candidate(
+    *,
+    candidates: list[ResolvedCompanyCandidate],
+    selection: int | None = None,
+) -> ResolvedCompanyCandidate:
+    if not candidates:
+        raise ValueError("No company candidates found.")
+    if selection is not None:
+        if selection < 1 or selection > len(candidates):
+            raise ValueError(f"Selection must be between 1 and {len(candidates)}.")
+        return candidates[selection - 1]
+    if len(candidates) == 1:
+        return candidates[0]
+
+    typer.echo("Multiple company matches found:\n")
+    for index, candidate in enumerate(candidates, start=1):
+        typer.echo(f"{index}. {candidate.display_name}")
+        typer.echo(f"   {candidate.summary}")
+
+    chosen = typer.prompt(
+        f"\nSelect a company [1-{len(candidates)}]",
+        type=int,
+    )
+    if chosen < 1 or chosen > len(candidates):
+        raise typer.BadParameter(f"Selection must be between 1 and {len(candidates)}.")
+    return candidates[chosen - 1]
+
+
+def _select_documents_for_derivation(
+    *,
+    documents,
+    document_roles: set[str],
+    latest_only: bool,
+    limit: int | None,
+):
+    selected = [
+        document
+        for document in documents
+        if not document_roles or document.document_role in document_roles
+    ]
+
+    if latest_only:
+        seen_roles: set[str] = set()
+        latest = []
+        for document in selected:
+            if document.document_role in seen_roles:
+                continue
+            seen_roles.add(document.document_role)
+            latest.append(document)
+        selected = latest
+
+    if limit is not None:
+        selected = selected[:limit]
+
+    return selected
+
+
 @app.callback()
 def main() -> None:
     """Initialize app settings and logging."""
     configure_logging()
 
 
-@app.command("list-frameworks")
-def list_frameworks() -> None:
-    """List registered frameworks."""
-    registry = load_framework_registry()
-    typer.echo(json.dumps(registry, indent=2))
-
-
-@app.command("lookup-isin")
-def lookup_isin(
-    isin: str = typer.Argument(..., help="ISIN to look up, e.g. GB0008847096"),
+@app.command("find-uk-company")
+def find_uk_company(
+    name: str = typer.Argument(..., help="UK company name to search, e.g. The Gym Group"),
+    limit: int = typer.Option(10, min=1, max=25, help="Maximum number of candidates to return."),
+    persist: bool = typer.Option(
+        False,
+        "--persist/--no-persist",
+        help="Persist the resolved LEI-based identity into the store.",
+    ),
     out: Optional[Path] = typer.Option(None, help="Optional path to write the result as JSON."),
 ) -> None:
-    """Resolve an ISIN via OpenFIGI and show the company name, exchange, and Yahoo ticker."""
-    settings = get_settings()
-    client = OpenFIGIClient(api_key=settings.openfigi_api_key)
+    """Search GLEIF for a UK legal entity and surface LEI plus related ISINs."""
+    client = GLEIFClient()
     try:
-        result = client.lookup_isin(isin)
-    except OpenFIGIError as exc:
-        logger.error("OpenFIGI lookup failed: %s", exc)
+        results = client.search_company(name, country="GB", limit=limit)
+    except GLEIFError as exc:
+        logger.error("GLEIF UK company search failed: %s", exc)
         raise typer.Exit(code=1) from exc
 
-    payload = result.model_dump(mode="json")
+    for result in results:
+        result.isins = client.get_isins(result.lei)
+    results = _rank_uk_candidates(query=name, results=results)
+
+    payload = {
+        "query": name,
+        "candidate_count": len(results),
+        "candidates": [
+            {
+                "lei": result.lei,
+                "legal_name": result.legal_name,
+                "country": result.country,
+                "jurisdiction": result.jurisdiction,
+                "city": result.city,
+                "registered_as": result.registered_as,
+                "status": result.status,
+                "registration_status": result.registration_status,
+                "isins": result.isins,
+                "other_names": result.other_names,
+            }
+            for result in results
+        ],
+    }
+    typer.echo(json.dumps(payload, indent=2))
+
+    if persist and results:
+        settings = get_settings()
+        try:
+            with session_scope(settings) as session:
+                persisted = CompanyIdentityService(session).upsert_from_gleif(record=results[0])
+        except Exception as exc:
+            logger.error("GLEIF identity persistence failed: %s", exc)
+            raise typer.Exit(code=1) from exc
+        state = "created" if persisted.created_company else "updated"
+        typer.echo(f"Stored company identity: {persisted.company_id} ({state})")
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        typer.echo(f"Wrote GLEIF UK company search result to {out}")
+
+
+@app.command("find-us-company")
+def find_us_company(
+    name: str = typer.Argument(..., help="US company name to search, e.g. Alphabet"),
+    limit: int = typer.Option(10, min=1, max=25, help="Maximum number of candidates to return."),
+    out: Optional[Path] = typer.Option(None, help="Optional path to write the result as JSON."),
+) -> None:
+    """Search SEC company ticker data for a US filer candidate."""
+    settings = get_settings()
+    client = SECTickerClient(settings)
+    try:
+        results = client.search_company(name, limit=limit)
+    except SECTickerError as exc:
+        logger.error("SEC company search failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    profiles_by_cik = _build_us_profiles(settings, results)
+    payload = _build_us_resolver_payload(
+        query=name,
+        results=results,
+        profiles_by_cik=profiles_by_cik,
+    )
     typer.echo(json.dumps(payload, indent=2))
 
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        typer.echo(f"Wrote OpenFIGI result to {out}")
+        typer.echo(f"Wrote SEC US company search result to {out}")
+
+
+@app.command("resolve-company")
+def resolve_company(
+    name: str = typer.Argument(..., help="Company name to resolve."),
+    market: Optional[str] = typer.Option(
+        None,
+        help="Optional market selector: uk, us, or auto. Omit to search both.",
+    ),
+    limit: int = typer.Option(10, min=1, max=25, help="Maximum candidates per market."),
+    out: Optional[Path] = typer.Option(None, help="Optional path to write the result as JSON."),
+) -> None:
+    """Resolve a company name across UK and/or US identity sources without auto-picking a final identity."""
+    selected = (market or "auto").strip().lower()
+    if selected not in {"auto", "uk", "us"}:
+        typer.echo("Market must be one of: uk, us, auto.")
+        raise typer.Exit(code=1)
+
+    payload: dict[str, object] = {
+        "query": name,
+        "markets_searched": ["uk", "us"] if selected == "auto" else [selected],
+        "uk_candidates": [],
+        "us_candidates": [],
+    }
+
+    if selected in {"auto", "uk"}:
+        uk_client = GLEIFClient()
+        try:
+            uk_results = uk_client.search_company(name, country="GB", limit=limit)
+        except GLEIFError:
+            uk_results = []
+        else:
+            for result in uk_results:
+                result.isins = uk_client.get_isins(result.lei)
+            uk_results = _rank_uk_candidates(query=name, results=uk_results)
+        payload["uk_candidates"] = _build_uk_candidate_list(uk_results)
+
+    if selected in {"auto", "us"}:
+        settings = get_settings()
+        us_client = SECTickerClient(settings)
+        try:
+            us_results = us_client.search_company(name, limit=limit)
+        except SECTickerError:
+            us_results = []
+            us_profiles_by_cik = {}
+        else:
+            us_profiles_by_cik = _build_us_profiles(settings, us_results)
+        payload["us_candidates"] = _build_us_candidate_list(
+            us_results,
+            profiles_by_cik=us_profiles_by_cik,
+        )
+
+    typer.echo(json.dumps(payload, indent=2))
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        typer.echo(f"Wrote company resolution result to {out}")
 
 
 @app.command("extract-text")
@@ -94,6 +548,15 @@ def extract_text_command(
                               help="PDF or HTML file to extract text from."),
     max_chars: Optional[int] = typer.Option(None, help="Truncate output to this many characters."),
     out: Optional[Path] = typer.Option(None, help="Optional path to write extracted text."),
+    document_id: Optional[str] = typer.Option(
+        None,
+        help="Optional existing document ID when persisting extracted text.",
+    ),
+    persist: bool = typer.Option(
+        False,
+        "--persist/--no-persist",
+        help="Persist the extracted narrative into the store.",
+    ),
 ) -> None:
     """Extract readable text from a PDF or HTML document (Docling for PDF, html.parser for HTML)."""
     try:
@@ -108,6 +571,23 @@ def extract_text_command(
         typer.echo(f"Wrote extracted text to {out} ({len(text):,} chars)")
     else:
         typer.echo(text)
+
+    if persist:
+        settings = get_settings()
+        try:
+            with session_scope(settings) as session:
+                persisted = ExtractionPersistenceService(session).persist_text_extraction(
+                    file_path=file,
+                    text=text,
+                    document_id=document_id,
+                )
+        except Exception as exc:
+            logger.error("Text extraction persistence failed: %s", exc)
+            raise typer.Exit(code=1) from exc
+        typer.echo(
+            f"Stored text extraction: {persisted.extraction_id} "
+            f"for document {persisted.document_id}"
+        )
 
 
 @app.command("fetch-market-data")
@@ -172,6 +652,719 @@ def backup_command(
     typer.echo(f"  Database dump: {result.db_dump_path}")
     typer.echo(f"  Data copy: {result.data_copy_path}")
     typer.echo(f"  Manifest: {result.manifest_path}")
+
+
+@app.command("show-company")
+def show_company(
+    company: str = typer.Option(..., help="Company ID, name, or known identifier value."),
+) -> None:
+    """Show a stored company identity record with identifiers and primary listing."""
+    settings = get_settings()
+    try:
+        with session_scope(settings) as session:
+            store = SQLCompanyContextStore(session)
+            company_record = store.get_company(company)
+            payload = {
+                "company": asdict(company_record),
+                "identifiers": [asdict(item) for item in store.get_identifiers(company_record.company_id)],
+                "primary_listing": (
+                    asdict(store.get_primary_listing(company_record.company_id))
+                    if store.get_primary_listing(company_record.company_id) is not None
+                    else None
+                ),
+            }
+    except Exception as exc:
+        logger.error("Company lookup failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("ingest-edgar-filings")
+def ingest_edgar_filings(
+    cik: str = typer.Option(..., help="SEC CIK, with or without leading zeros."),
+    forms: str = typer.Option(
+        "10-K,10-Q,8-K,20-F,40-F,6-K",
+        help="Comma-separated EDGAR forms to include.",
+    ),
+    limit: int = typer.Option(20, min=1, max=200, help="Maximum number of filings to return."),
+    download: bool = typer.Option(
+        False,
+        "--download/--no-download",
+        help="Download the discovered primary filing documents.",
+    ),
+    persist: bool = typer.Option(
+        True,
+        "--persist/--no-persist",
+        help="Persist the discovered company and filing records into the store.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None,
+        help="Optional path for writing the discovery result as JSON.",
+    ),
+    materialize: bool = typer.Option(
+        False,
+        "--materialize/--no-materialize",
+        help="After persistence, extract and chunk each stored filing where a source artifact is available.",
+    ),
+) -> None:
+    """Discover EDGAR filings for a company by CIK using SEC public endpoints."""
+    settings = get_settings()
+    client = EdgarClient(settings)
+    form_list = tuple(item.strip().upper() for item in forms.split(",") if item.strip())
+
+    form_guidance = None
+    try:
+        filer_profile = client.inspect_filer(cik=cik)
+    except EdgarError:
+        filer_profile = None
+    else:
+        form_guidance = _build_edgar_form_guidance(
+            cik=cik,
+            requested_forms=form_list,
+            filer_profile=filer_profile,
+        )
+        if not form_guidance["forms_match"]:
+            typer.echo(
+                json.dumps(
+                    {
+                        "edgar_form_guidance": form_guidance,
+                        "warning": (
+                            "Requested forms do not match the likely EDGAR filing family "
+                            "for this issuer."
+                        ),
+                    },
+                    indent=2,
+                )
+            )
+
+    try:
+        submissions = client.discover_filings(cik=cik, forms=form_list, limit=limit)
+    except EdgarError as exc:
+        logger.error("EDGAR discovery failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    downloaded_files: dict[str, Path] = {}
+    if download:
+        for filing in submissions.filings:
+            try:
+                downloaded_files[filing.accession_number] = client.download_filing(filing)
+            except EdgarError as exc:
+                logger.warning("EDGAR download failed for %s: %s", filing.accession_number, exc)
+
+    payload = submissions.model_dump(mode="json")
+    if form_guidance is not None:
+        payload["edgar_form_guidance"] = form_guidance
+    if downloaded_files:
+        payload["downloaded_files"] = {
+            accession: str(path) for accession, path in downloaded_files.items()
+        }
+    typer.echo(json.dumps(payload, indent=2))
+
+    if persist:
+        try:
+            with session_scope(settings) as session:
+                persisted = EdgarIngestionService(session).persist_submissions(
+                    submissions=submissions,
+                    downloaded_files=downloaded_files or None,
+                )
+                materialized: list[dict[str, object]] = []
+                if materialize:
+                    for stored_document_id in persisted.document_ids:
+                        try:
+                            materialized.append(
+                                _derive_document_context(
+                                    session=session,
+                                    document_id=stored_document_id,
+                                )
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Document materialization skipped for %s: %s",
+                                stored_document_id,
+                                exc,
+                            )
+        except Exception as exc:
+            logger.error("EDGAR persistence failed: %s", exc)
+            raise typer.Exit(code=1) from exc
+
+        typer.echo(
+            f"Stored EDGAR company {persisted.company_id} "
+            f"with {len(persisted.document_ids)} filings"
+        )
+        if materialize and materialized:
+            typer.echo(json.dumps({"derived_document_contexts": materialized}, indent=2))
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        typer.echo(f"Wrote EDGAR discovery result to {out}")
+
+
+@app.command("list-documents")
+def list_documents(
+    company: str = typer.Option(..., help="Company ID, name, or known identifier value."),
+) -> None:
+    """List stored documents for a company."""
+    settings = get_settings()
+    try:
+        with session_scope(settings) as session:
+            store = SQLCompanyContextStore(session)
+            company_record = store.get_company(company)
+            documents = store.get_latest_documents(company_record.company_id)
+            payload = {
+                "company": asdict(company_record),
+                "documents": [asdict(item) for item in documents],
+            }
+    except Exception as exc:
+        logger.error("Document lookup failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("list-artifacts")
+def list_artifacts(
+    company: str = typer.Option(..., help="Company ID, name, or known identifier value."),
+) -> None:
+    """List stored artifacts for a company with document provenance."""
+    settings = get_settings()
+    try:
+        with session_scope(settings) as session:
+            store = SQLCompanyContextStore(session)
+            company_record = store.get_company(company)
+            artifacts = store.list_artifacts_for_company(company_record.company_id)
+            payload = {
+                "company": asdict(company_record),
+                "artifacts": [
+                    {
+                        "artifact": asdict(item.artifact),
+                        "document": asdict(item.document),
+                    }
+                    for item in artifacts
+                ],
+            }
+    except Exception as exc:
+        logger.error("Artifact lookup failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("show-document")
+def show_document(
+    document_id: str = typer.Option(..., help="Stored document ID."),
+) -> None:
+    """Show a stored document and its associated artifacts."""
+    settings = get_settings()
+    try:
+        with session_scope(settings) as session:
+            store = SQLCompanyContextStore(session)
+            document = store.get_document(document_id)
+            artifacts = store.get_document_artifacts(document_id)
+            payload = {
+                "document": asdict(document),
+                "artifacts": [asdict(item) for item in artifacts],
+            }
+    except Exception as exc:
+        logger.error("Document detail lookup failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("show-artifact")
+def show_artifact(
+    artifact_id: str = typer.Option(..., help="Stored artifact ID."),
+) -> None:
+    """Show a stored artifact with its parent document and company provenance."""
+    settings = get_settings()
+    try:
+        with session_scope(settings) as session:
+            store = SQLCompanyContextStore(session)
+            result = store.get_artifact(artifact_id)
+            payload = {
+                "company": asdict(result.company),
+                "document": asdict(result.document),
+                "artifact": asdict(result.artifact),
+            }
+    except Exception as exc:
+        logger.error("Artifact detail lookup failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("show-facts")
+def show_facts(
+    company: str = typer.Option(..., help="Company ID, name, or known identifier value."),
+    document_role: Optional[str] = typer.Option(
+        None,
+        help="Optional document role filter, e.g. ANNUAL_REPORT or INTERIM_REPORT.",
+    ),
+    limit: int = typer.Option(50, min=1, max=500, help="Maximum number of facts to show."),
+) -> None:
+    """Show stored structured facts for a company."""
+    settings = get_settings()
+    try:
+        with session_scope(settings) as session:
+            store = SQLCompanyContextStore(session)
+            company_record = store.get_company(company)
+            fact_set = store.get_fact_set(company_record.company_id, document_role=document_role)
+            payload = {
+                "company": asdict(company_record),
+                "document_role": document_role,
+                "fact_count": len(fact_set.facts),
+                "facts": fact_set.facts[:limit],
+            }
+    except Exception as exc:
+        logger.error("Fact lookup failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("chunk-document")
+def chunk_document(
+    document_id: str = typer.Option(..., help="Stored document ID to chunk from narrative extracts."),
+    max_chars: int = typer.Option(1200, min=200, max=5000, help="Target chunk size in characters."),
+    overlap_chars: int = typer.Option(150, min=0, max=1000, help="Character overlap between adjacent chunks."),
+) -> None:
+    """Chunk stored narrative extracts for a document into retrieval passages."""
+    settings = get_settings()
+    try:
+        with session_scope(settings) as session:
+            result = NarrativeChunkingService(session).chunk_document(
+                document_id=document_id,
+                max_chars=max_chars,
+                overlap_chars=overlap_chars,
+            )
+    except Exception as exc:
+        logger.error("Document chunking failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        f"Stored {result.chunk_count} chunks for document {result.document_id}"
+    )
+
+
+@app.command("derive-document-context")
+def derive_document_context(
+    document_id: str = typer.Option(..., help="Stored document ID to extract and chunk."),
+    strategy: str = typer.Option(
+        "auto",
+        help="Extraction strategy: auto, ixbrl, or text.",
+    ),
+    chunk: bool = typer.Option(
+        True,
+        "--chunk/--no-chunk",
+        help="Chunk stored narratives after extraction.",
+    ),
+    max_chars: int = typer.Option(1200, min=200, max=5000, help="Target chunk size in characters."),
+    overlap_chars: int = typer.Option(150, min=0, max=1000, help="Character overlap between adjacent chunks."),
+) -> None:
+    """Derive stored facts, narratives, and retrieval chunks from a stored document."""
+    settings = get_settings()
+    try:
+        with session_scope(settings) as session:
+            result = DocumentPipelineService(session).materialize_document(
+                document_id=document_id,
+                strategy=strategy,
+                chunk=chunk,
+                max_chars=max_chars,
+                overlap_chars=overlap_chars,
+            )
+            payload = {
+                "document_id": result.document_id,
+                "artifact_id": result.artifact_id,
+                "artifact_path": result.artifact_path,
+                "strategy": result.strategy,
+                "extraction_id": result.extraction_id,
+                "fact_count": result.fact_count,
+                "narrative_count": result.narrative_count,
+                "chunk_count": result.chunk_count,
+            }
+    except Exception as exc:
+        logger.error("Document materialization failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("derive-company-context")
+def derive_company_context(
+    company: str = typer.Option(..., help="Company ID, name, or known identifier value."),
+    document_role: list[str] = typer.Option(
+        None,
+        "--document-role",
+        help="Optional document role filter. Repeatable, e.g. --document-role ANNUAL_REPORT.",
+    ),
+    latest_only: bool = typer.Option(
+        True,
+        "--latest-only/--all-matching",
+        help="Only derive the latest document per selected role.",
+    ),
+    limit: Optional[int] = typer.Option(
+        None,
+        min=1,
+        max=50,
+        help="Optional cap on number of documents to derive after filtering.",
+    ),
+    strategy: str = typer.Option(
+        "auto",
+        help="Extraction strategy: auto, ixbrl, or text.",
+    ),
+    chunk: bool = typer.Option(
+        True,
+        "--chunk/--no-chunk",
+        help="Chunk stored narratives after extraction.",
+    ),
+    max_chars: int = typer.Option(1200, min=200, max=5000, help="Target chunk size in characters."),
+    overlap_chars: int = typer.Option(150, min=0, max=1000, help="Character overlap between adjacent chunks."),
+) -> None:
+    """Derive stored facts, narratives, and retrieval chunks for selected company documents."""
+    settings = get_settings()
+    normalized_roles = _normalize_document_roles(document_role)
+    try:
+        with session_scope(settings) as session:
+            store = SQLCompanyContextStore(session)
+            company_record = store.get_company(company)
+            documents = store.get_latest_documents(company_record.company_id)
+            selected_documents = _select_documents_for_derivation(
+                documents=documents,
+                document_roles=normalized_roles,
+                latest_only=latest_only,
+                limit=limit,
+            )
+
+            pipeline = DocumentPipelineService(session)
+            derived = []
+            skipped = []
+            for document_record in selected_documents:
+                try:
+                    result = pipeline.materialize_document(
+                        document_id=document_record.document_id,
+                        strategy=strategy,
+                        chunk=chunk,
+                        max_chars=max_chars,
+                        overlap_chars=overlap_chars,
+                    )
+                except Exception as exc:
+                    skipped.append(
+                        {
+                            "document_id": document_record.document_id,
+                            "document_role": document_record.document_role,
+                            "title": document_record.title,
+                            "reason": str(exc),
+                        }
+                    )
+                    continue
+
+                derived.append(
+                    {
+                        "document_id": result.document_id,
+                        "document_role": document_record.document_role,
+                        "title": document_record.title,
+                        "artifact_id": result.artifact_id,
+                        "artifact_path": result.artifact_path,
+                        "strategy": result.strategy,
+                        "extraction_id": result.extraction_id,
+                        "fact_count": result.fact_count,
+                        "narrative_count": result.narrative_count,
+                        "chunk_count": result.chunk_count,
+                    }
+                )
+
+            payload = {
+                "company": asdict(company_record),
+                "filters": {
+                    "document_roles": sorted(normalized_roles) if normalized_roles else [],
+                    "latest_only": latest_only,
+                    "limit": limit,
+                    "strategy": strategy,
+                    "chunk": chunk,
+                },
+                "selected_document_count": len(selected_documents),
+                "derived_document_count": len(derived),
+                "derived_documents": derived,
+                "skipped_documents": skipped,
+            }
+    except Exception as exc:
+        logger.error("Company context derivation failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("build-company-context")
+def build_company_context(
+    company_name: str = typer.Argument(..., help="Company name to resolve, ingest, and derive."),
+    market: str = typer.Option(
+        "auto",
+        help="Market selector: uk, us, or auto.",
+    ),
+    limit: int = typer.Option(10, min=1, max=25, help="Maximum resolution candidates per market."),
+    selection: Optional[int] = typer.Option(
+        None,
+        help="Optional 1-based candidate selection to avoid the interactive prompt.",
+    ),
+    uk_document_type: str = typer.Option(
+        "annual-report",
+        help="UK NSM document type to ingest when a UK company is selected.",
+    ),
+    us_forms: Optional[str] = typer.Option(
+        None,
+        help="Optional comma-separated EDGAR forms override when a US company is selected.",
+    ),
+    us_limit: int = typer.Option(
+        10,
+        min=1,
+        max=200,
+        help="Maximum EDGAR filings to ingest when a US company is selected.",
+    ),
+    download: bool = typer.Option(
+        True,
+        "--download/--no-download",
+        help="Download filing documents during ingestion where supported.",
+    ),
+    derive_latest_only: bool = typer.Option(
+        True,
+        "--latest-only/--all-derived",
+        help="Derive only the latest stored document per role after ingestion.",
+    ),
+    derive_limit: Optional[int] = typer.Option(
+        None,
+        min=1,
+        max=50,
+        help="Optional cap on number of documents to derive after ingestion.",
+    ),
+    strategy: str = typer.Option(
+        "auto",
+        help="Derivation strategy: auto, ixbrl, or text.",
+    ),
+    chunk: bool = typer.Option(
+        True,
+        "--chunk/--no-chunk",
+        help="Chunk stored narratives after derivation.",
+    ),
+    max_chars: int = typer.Option(1200, min=200, max=5000, help="Target chunk size in characters."),
+    overlap_chars: int = typer.Option(150, min=0, max=1000, help="Character overlap between adjacent chunks."),
+) -> None:
+    """Resolve a company, ingest the relevant filings, and derive retrieval-ready company context."""
+    selected_market = market.strip().lower()
+    if selected_market not in {"auto", "uk", "us"}:
+        typer.echo("Market must be one of: uk, us, auto.")
+        raise typer.Exit(code=1)
+
+    settings = get_settings()
+
+    try:
+        candidates = _resolve_company_candidates(
+            name=company_name,
+            market=selected_market,
+            limit=limit,
+            settings=settings,
+        )
+        chosen = _choose_company_candidate(candidates=candidates, selection=selection)
+    except Exception as exc:
+        logger.error("Company resolution failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    ingestion_summary: dict[str, object]
+    derived_payload: dict[str, object]
+
+    try:
+        with session_scope(settings) as session:
+            if chosen.market == "uk":
+                lei = str(chosen.payload["lei"])
+                gleif_client = GLEIFClient()
+                gleif_record = gleif_client.get_record(lei)
+                gleif_record.isins = gleif_client.get_isins(lei)
+
+                result = NSMDownloadService(settings=settings).run(
+                    NSMDownloadRequest(
+                        query=gleif_record.legal_name,
+                        document_type=uk_document_type,
+                        headed=False,
+                        browser_channel=None,
+                        max_results=10,
+                    )
+                )
+
+                gleif_write = CompanyIdentityService(session).upsert_from_gleif(record=gleif_record)
+                write_result = DocumentIngestionService(session).persist_nsm_download_result(
+                    query=gleif_record.legal_name,
+                    result=result,
+                    company_id=gleif_write.company_id,
+                )
+                target_company_ref = gleif_write.company_id
+                ingestion_summary = {
+                    "market": "uk",
+                    "selected_company": {
+                        "display_name": chosen.display_name,
+                        "summary": chosen.summary,
+                        "lei": lei,
+                    },
+                    "ingested_documents": [write_result.document_id],
+                    "document_type": uk_document_type,
+                }
+            else:
+                cik = str(chosen.payload["cik"])
+                filer_profile = chosen.payload.get("edgar_profile", {})
+                suggested_forms = filer_profile.get("suggested_forms") or [
+                    "10-K",
+                    "10-Q",
+                    "8-K",
+                    "20-F",
+                    "6-K",
+                ]
+                forms_csv = us_forms or ",".join(suggested_forms)
+                form_list = tuple(item.strip().upper() for item in forms_csv.split(",") if item.strip())
+
+                edgar_client = EdgarClient(settings)
+                submissions = edgar_client.discover_filings(cik=cik, forms=form_list, limit=us_limit)
+                downloaded_files: dict[str, Path] = {}
+                if download:
+                    for filing in submissions.filings:
+                        try:
+                            downloaded_files[filing.accession_number] = edgar_client.download_filing(filing)
+                        except EdgarError as exc:
+                            logger.warning(
+                                "EDGAR download failed for %s: %s",
+                                filing.accession_number,
+                                exc,
+                            )
+
+                persisted = EdgarIngestionService(session).persist_submissions(
+                    submissions=submissions,
+                    downloaded_files=downloaded_files or None,
+                )
+                target_company_ref = persisted.company_id
+                ingestion_summary = {
+                    "market": "us",
+                    "selected_company": {
+                        "display_name": chosen.display_name,
+                        "summary": chosen.summary,
+                        "cik": cik,
+                    },
+                    "ingested_documents": persisted.document_ids,
+                    "forms": list(form_list),
+                    "filing_count": len(submissions.filings),
+                }
+
+            store = SQLCompanyContextStore(session)
+            company_record = store.get_company(target_company_ref)
+            documents = store.get_latest_documents(company_record.company_id)
+            selected_documents = _select_documents_for_derivation(
+                documents=documents,
+                document_roles=set(),
+                latest_only=derive_latest_only,
+                limit=derive_limit,
+            )
+
+            pipeline = DocumentPipelineService(session)
+            derived = []
+            skipped = []
+            for document_record in selected_documents:
+                try:
+                    result = pipeline.materialize_document(
+                        document_id=document_record.document_id,
+                        strategy=strategy,
+                        chunk=chunk,
+                        max_chars=max_chars,
+                        overlap_chars=overlap_chars,
+                    )
+                except Exception as exc:
+                    skipped.append(
+                        {
+                            "document_id": document_record.document_id,
+                            "document_role": document_record.document_role,
+                            "title": document_record.title,
+                            "reason": str(exc),
+                        }
+                    )
+                    continue
+
+                derived.append(
+                    {
+                        "document_id": result.document_id,
+                        "document_role": document_record.document_role,
+                        "title": document_record.title,
+                        "artifact_id": result.artifact_id,
+                        "artifact_path": result.artifact_path,
+                        "strategy": result.strategy,
+                        "extraction_id": result.extraction_id,
+                        "fact_count": result.fact_count,
+                        "narrative_count": result.narrative_count,
+                        "chunk_count": result.chunk_count,
+                    }
+                )
+
+            derived_payload = {
+                "company": asdict(company_record),
+                "selected_document_count": len(selected_documents),
+                "derived_document_count": len(derived),
+                "derived_documents": derived,
+                "skipped_documents": skipped,
+                "filters": {
+                    "latest_only": derive_latest_only,
+                    "limit": derive_limit,
+                    "strategy": strategy,
+                    "chunk": chunk,
+                },
+            }
+    except Exception as exc:
+        logger.error("Company context build failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    payload = {
+        "requested_company_name": company_name,
+        "resolution": {
+            "market": chosen.market,
+            "display_name": chosen.display_name,
+            "summary": chosen.summary,
+            "payload": chosen.payload,
+        },
+        "ingestion": ingestion_summary,
+        "derived_company_context": derived_payload,
+    }
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("search-passages")
+def search_passages(
+    company: str = typer.Option(..., help="Company ID, name, or known identifier value."),
+    query: str = typer.Option(..., help="Case-insensitive substring to search for in stored chunks."),
+    document_role: Optional[str] = typer.Option(
+        None,
+        help="Optional document role filter, e.g. ANNUAL_REPORT or INTERIM_REPORT.",
+    ),
+    limit: int = typer.Option(20, min=1, max=100, help="Maximum number of passages to return."),
+) -> None:
+    """Search chunked filing passages stored for a company."""
+    settings = get_settings()
+    try:
+        with session_scope(settings) as session:
+            store = SQLCompanyContextStore(session)
+            company_record = store.get_company(company)
+            passages = store.search_passages(
+                company_record.company_id,
+                query=query,
+                document_role=document_role,
+                limit=limit,
+            )
+            payload = {
+                "company": asdict(company_record),
+                "query": query,
+                "document_role": document_role,
+                "passage_count": len(passages),
+                "passages": [asdict(item) for item in passages],
+            }
+    except Exception as exc:
+        logger.error("Passage search failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(payload, indent=2))
 
 
 @app.command("restore")
@@ -305,6 +1498,20 @@ def ingest_nsm_report(
         None,
         help="Optional path for writing run metadata as JSON.",
     ),
+    company_id: Optional[str] = typer.Option(
+        None,
+        help="Optional existing company ID to attach the stored document to.",
+    ),
+    persist: bool = typer.Option(
+        True,
+        "--persist/--no-persist",
+        help="Persist the ingested document and artifacts into the store.",
+    ),
+    materialize: bool = typer.Option(
+        False,
+        "--materialize/--no-materialize",
+        help="After persistence, extract and chunk the stored document.",
+    ),
 ) -> None:
     """Download an NSM filing for a company. Run once per document type."""
     settings = get_settings()
@@ -326,10 +1533,258 @@ def ingest_nsm_report(
     payload = result.model_dump(mode="json")
     typer.echo(json.dumps(payload, indent=2))
 
+    if persist:
+        try:
+            with session_scope(settings) as session:
+                write_result = DocumentIngestionService(session).persist_nsm_download_result(
+                    query=query,
+                    result=result,
+                    company_id=company_id,
+                )
+                materialized = None
+                if materialize:
+                    materialized = _derive_document_context(
+                        session=session,
+                        document_id=write_result.document_id,
+                    )
+        except Exception as exc:
+            logger.error("NSM document persistence failed: %s", exc)
+            raise typer.Exit(code=1) from exc
+
+        typer.echo(
+            f"Stored NSM document: {write_result.document_id} "
+            f"for company {write_result.company_id} "
+            f"with {len(write_result.artifacts)} artifacts"
+        )
+        if materialize and materialized is not None:
+            typer.echo(json.dumps({"derived_document_context": materialized}, indent=2))
+
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         typer.echo(f"Wrote NSM acquisition metadata to {out}")
+
+
+@app.command("ingest-nsm-company")
+def ingest_nsm_company(
+    lei: str = typer.Option(..., help="GLEIF LEI for the UK company."),
+    document_type: str = typer.Option(
+        "annual-report",
+        help="Document type to fetch: annual-report or interim-report.",
+    ),
+    headed: bool = typer.Option(
+        False,
+        help="Launch a visible browser window for debugging the site flow.",
+    ),
+    browser_channel: Optional[str] = typer.Option(
+        None,
+        help="Optional browser channel, for example 'chrome' or 'msedge'.",
+    ),
+    max_results: int = typer.Option(
+        10,
+        min=1,
+        max=50,
+        help="Maximum candidate rows to inspect in the search results view.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None,
+        help="Optional path for writing run metadata as JSON.",
+    ),
+    company_id: Optional[str] = typer.Option(
+        None,
+        help="Optional existing company ID to attach the stored document to.",
+    ),
+    persist: bool = typer.Option(
+        True,
+        "--persist/--no-persist",
+        help="Persist the ingested document and artifacts into the store.",
+    ),
+    materialize: bool = typer.Option(
+        False,
+        "--materialize/--no-materialize",
+        help="After persistence, extract and chunk the stored document.",
+    ),
+) -> None:
+    """Resolve a UK company by LEI, then retrieve and optionally store NSM filings."""
+    try:
+        gleif_record = GLEIFClient().get_record(lei)
+        gleif_record.isins = GLEIFClient().get_isins(lei)
+    except GLEIFError as exc:
+        logger.error("GLEIF LEI lookup failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    query = gleif_record.legal_name
+    typer.echo(
+        json.dumps(
+            {
+                "lei": gleif_record.lei,
+                "legal_name": gleif_record.legal_name,
+                "isins": gleif_record.isins,
+                "document_type": document_type,
+            },
+            indent=2,
+        )
+    )
+
+    settings = get_settings()
+    service = NSMDownloadService(settings=settings)
+    request = NSMDownloadRequest(
+        query=query,
+        document_type=document_type,
+        headed=headed,
+        browser_channel=browser_channel,
+        max_results=max_results,
+    )
+
+    try:
+        result = service.run(request)
+    except NSMSearchError as exc:
+        logger.error("NSM acquisition failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    payload = {
+        "resolved_identity": {
+            "lei": gleif_record.lei,
+            "legal_name": gleif_record.legal_name,
+            "isins": gleif_record.isins,
+        },
+        "nsm_result": result.model_dump(mode="json"),
+    }
+    typer.echo(json.dumps(payload, indent=2))
+
+    if persist:
+        try:
+            with session_scope(settings) as session:
+                if company_id is None:
+                    gleif_write = CompanyIdentityService(session).upsert_from_gleif(record=gleif_record)
+                    target_company_id = gleif_write.company_id
+                else:
+                    target_company_id = company_id
+
+                write_result = DocumentIngestionService(session).persist_nsm_download_result(
+                    query=query,
+                    result=result,
+                    company_id=target_company_id,
+                )
+                materialized = None
+                if materialize:
+                    materialized = _derive_document_context(
+                        session=session,
+                        document_id=write_result.document_id,
+                    )
+        except Exception as exc:
+            logger.error("NSM company persistence failed: %s", exc)
+            raise typer.Exit(code=1) from exc
+
+        typer.echo(
+            f"Stored NSM document: {write_result.document_id} "
+            f"for company {write_result.company_id} "
+            f"with {len(write_result.artifacts)} artifacts"
+        )
+        if materialize and materialized is not None:
+            typer.echo(json.dumps({"derived_document_context": materialized}, indent=2))
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        typer.echo(f"Wrote NSM company acquisition metadata to {out}")
+
+
+@app.command("discover-nsm-annual-history")
+def discover_nsm_annual_history(
+    lei: str = typer.Option(..., help="GLEIF LEI for the UK company."),
+    years: int = typer.Option(5, min=1, max=10, help="How many filing years to try to discover."),
+    headed: bool = typer.Option(
+        False,
+        help="Launch a visible browser window for debugging the site flow.",
+    ),
+    browser_channel: Optional[str] = typer.Option(
+        None,
+        help="Optional browser channel, for example 'chrome' or 'msedge'.",
+    ),
+    max_candidates: int = typer.Option(
+        50,
+        min=10,
+        max=200,
+        help="Maximum NSM result rows to inspect before local annual-history selection.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None,
+        help="Optional path for writing discovery output as JSON.",
+    ),
+) -> None:
+    """Discover likely annual-report candidates across recent years for a UK company via NSM."""
+    try:
+        gleif_client = GLEIFClient()
+        gleif_record = gleif_client.get_record(lei)
+        gleif_record.isins = gleif_client.get_isins(lei)
+    except GLEIFError as exc:
+        logger.error("GLEIF LEI lookup failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    settings = get_settings()
+    service = NSMDownloadService(settings=settings)
+    try:
+        discovery = service.discover_annual_history(
+            query=gleif_record.legal_name,
+            years=years,
+            headed=headed,
+            browser_channel=browser_channel,
+            max_candidates=max_candidates,
+        )
+    except NSMSearchError as exc:
+        logger.error("NSM annual history discovery failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    payload = {
+        "resolved_identity": {
+            "lei": gleif_record.lei,
+            "legal_name": gleif_record.legal_name,
+            "isins": gleif_record.isins,
+        },
+        "annual_history_discovery": discovery.model_dump(mode="json"),
+    }
+    typer.echo(json.dumps(payload, indent=2))
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        typer.echo(f"Wrote NSM annual history discovery to {out}")
+
+
+@app.command("discover-edgar-annual-history")
+def discover_edgar_annual_history(
+    cik: str = typer.Option(..., help="SEC CIK, with or without leading zeros."),
+    years: int = typer.Option(5, min=1, max=10, help="How many filing years to try to discover."),
+    limit: int = typer.Option(
+        100,
+        min=10,
+        max=500,
+        help="Maximum EDGAR annual filings to inspect before local year selection.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None,
+        help="Optional path for writing discovery output as JSON.",
+    ),
+) -> None:
+    """Discover likely annual filing candidates across recent years for a US filer via EDGAR."""
+    settings = get_settings()
+    client = EdgarClient(settings)
+    try:
+        discovery = client.discover_annual_history(cik=cik, years=years, limit=limit)
+    except EdgarError as exc:
+        logger.error("EDGAR annual history discovery failed: %s", exc)
+        raise typer.Exit(code=1) from exc
+
+    payload = {
+        "annual_history_discovery": discovery.model_dump(mode="json"),
+    }
+    typer.echo(json.dumps(payload, indent=2))
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        typer.echo(f"Wrote EDGAR annual history discovery to {out}")
 
 
 @app.command("parse-xhtml-report")
@@ -393,6 +1848,15 @@ def extract_ixbrl_facts(
         None,
         help="Optional path for writing extracted facts as JSONL.",
     ),
+    document_id: Optional[str] = typer.Option(
+        None,
+        help="Optional existing document ID when persisting extracted facts.",
+    ),
+    persist: bool = typer.Option(
+        False,
+        "--persist/--no-persist",
+        help="Persist extracted iXBRL facts and narratives into the store.",
+    ),
 ) -> None:
     """Extract structured iXBRL facts from an XHTML annual report."""
     extractor = IXBRLExtractor()
@@ -415,6 +1879,23 @@ def extract_ixbrl_facts(
         jsonl_out.parent.mkdir(parents=True, exist_ok=True)
         jsonl_out.write_text(result.to_jsonl(), encoding="utf-8")
         typer.echo(f"Wrote iXBRL facts JSONL to {jsonl_out}")
+
+    if persist:
+        settings = get_settings()
+        try:
+            with session_scope(settings) as session:
+                persisted = ExtractionPersistenceService(session).persist_ixbrl_extraction(
+                    extraction=result,
+                    document_id=document_id,
+                )
+        except Exception as exc:
+            logger.error("iXBRL extraction persistence failed: %s", exc)
+            raise typer.Exit(code=1) from exc
+        typer.echo(
+            f"Stored iXBRL extraction: {persisted.extraction_id} "
+            f"for document {persisted.document_id} "
+            f"with {persisted.fact_count} facts and {persisted.narrative_count} narratives"
+        )
 
 
 @app.command("summarize-ixbrl")
@@ -443,323 +1924,6 @@ def summarize_ixbrl(
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         typer.echo(f"Wrote iXBRL fact set to {out}")
-
-
-
-@app.command("build-ivf-packet-from-ixbrl")
-def build_ivf_packet_from_ixbrl(
-    file: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False),
-    post_period_file: Optional[Path] = typer.Option(
-        None,
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        help="Optional post-period file: XHTML for iXBRL, HTML/PDF for text extraction.",
-    ),
-    post_period_type: str = typer.Option(
-        "INTERIM_OR_UPDATE",
-        help="Label for the post-period file, e.g. HALF_YEAR_REPORT or TRADING_UPDATE.",
-    ),
-    market_data_file: Optional[Path] = typer.Option(
-        None,
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-        help="Optional JSON output from 'fetch-market-data --out' to include market context.",
-    ),
-    out: Optional[Path] = typer.Option(
-        None,
-        help="Optional path for writing the IVF packet as JSON.",
-    ),
-) -> None:
-    """Build a first-pass IVF packet from an annual report XHTML, with optional post-period and market data."""
-    from research_platform.documents.text_extractor import TextExtractionError, extract_text
-    from research_platform.sources.market import FinancialHistory, MarketSnapshot
-
-    extractor = IXBRLExtractor()
-    fact_set_builder = IXBRLFactSetBuilder()
-    packet_builder = IVFFIXBRLPacketBuilder()
-
-    try:
-        extraction = extractor.extract(file)
-    except IXBRLExtractionError as exc:
-        logger.error("iXBRL extraction failed: %s", exc)
-        raise typer.Exit(code=1) from exc
-
-    fact_set = fact_set_builder.build(extraction)
-
-    # Post-period: XHTML → iXBRL facts; HTML/PDF → text extraction
-    post_period_fact_set = None
-    post_period_narrative = None
-    if post_period_file is not None:
-        if post_period_file.suffix.lower() == ".xhtml":
-            try:
-                post_extraction = extractor.extract(post_period_file)
-                post_period_fact_set = fact_set_builder.build(post_extraction)
-            except IXBRLExtractionError as exc:
-                logger.error("Post-period iXBRL extraction failed: %s", exc)
-                raise typer.Exit(code=1) from exc
-        else:
-            try:
-                post_period_narrative = extract_text(post_period_file)
-                logger.info("Post-period text extracted: %d chars", len(post_period_narrative))
-            except TextExtractionError as exc:
-                logger.error("Post-period text extraction failed: %s", exc)
-                raise typer.Exit(code=1) from exc
-
-    # Market data: load from JSON file produced by fetch-market-data
-    market_snapshot = None
-    market_history = None
-    if market_data_file is not None:
-        try:
-            md = json.loads(market_data_file.read_text(encoding="utf-8"))
-            market_snapshot = MarketSnapshot(**md["snapshot"])
-            market_history = FinancialHistory(**md["history"])
-        except Exception as exc:
-            logger.error("Failed to load market data: %s", exc)
-            raise typer.Exit(code=1) from exc
-
-    packet = packet_builder.build(
-        fact_set=fact_set,
-        post_period_fact_set=post_period_fact_set,
-        post_period_type=post_period_type,
-        post_period_narrative=post_period_narrative,
-        market_snapshot=market_snapshot,
-        market_history=market_history,
-    )
-    payload = packet.model_dump(mode="json")
-    typer.echo(json.dumps(payload, indent=2))
-
-    if out is not None:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        typer.echo(f"Wrote IVF packet to {out}")
-
-
-@app.command("run-ivf-pre-screen")
-def run_ivf_pre_screen(
-    packet_file: Path = typer.Option(..., exists=True, file_okay=True, dir_okay=False),
-    out: Optional[Path] = typer.Option(
-        None,
-        help="Optional path for writing the validated IVF pre-screen result as JSON.",
-    ),
-    prompt_out: Optional[Path] = typer.Option(
-        None,
-        help="Optional path for writing the raw prompt snapshot.",
-    ),
-    raw_response_out: Optional[Path] = typer.Option(
-        None,
-        help="Optional path for writing the raw model response.",
-    ),
-) -> None:
-    """Run the IVF pre-screen LLM step against a broad packet."""
-    settings = get_settings()
-    packet = json.loads(packet_file.read_text(encoding="utf-8"))
-    llm_client = create_llm_client(settings)
-    runner = IVFPreScreenRunner(
-        llm_client=llm_client,
-        model=settings.llm_model,
-        temperature=settings.ivf_pre_screen_temperature,
-        max_repair_attempts=settings.ivf_pre_screen_max_repair_attempts,
-    )
-    result = runner.run(
-        packet=packet,
-        prompt_out=prompt_out,
-        raw_response_out=raw_response_out,
-    )
-    payload = runner.build_run_payload(
-        packet=packet,
-        result=result,
-        provider=llm_client.provider_name,
-        model=settings.llm_model,
-    )
-    typer.echo(json.dumps(payload, indent=2))
-
-    if out is not None:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        typer.echo(f"Wrote IVF pre-screen result to {out}")
-
-
-@app.command("run-ivf-screen")
-def run_ivf_screen(
-    isin: str = typer.Option(..., help="ISIN of the company to screen, e.g. GB0008847096."),
-    headed: bool = typer.Option(False, help="Run NSM browser in headed mode for debugging."),
-    out_dir: Path = typer.Option(Path("data/results"), help="Base directory for run outputs."),
-) -> None:
-    """End-to-end IVF pre-screen: resolve ISIN → download NSM reports → fetch market data → run pre-screen."""
-    from datetime import date as _date
-
-    from research_platform.documents.text_extractor import TextExtractionError, extract_text
-    from research_platform.sources.market import (
-        FinancialHistory,
-        MarketDataError,
-        MarketSnapshot,
-        YFinanceClient,
-    )
-
-    settings = get_settings()
-    run_date = _date.today().isoformat()
-
-    # ── 1. Resolve ISIN ──────────────────────────────────────────────────────
-    typer.echo(f"[1/7] Resolving {isin} via OpenFIGI...")
-    try:
-        figi = OpenFIGIClient(api_key=settings.openfigi_api_key).lookup_isin(isin)
-    except OpenFIGIError as exc:
-        logger.error("OpenFIGI lookup failed: %s", exc)
-        raise typer.Exit(code=1) from exc
-
-    company_name = figi.name
-    yahoo_ticker = to_yahoo_ticker(figi.ticker, figi.exch_code)
-    slug = "".join(c if c.isalnum() or c == "-" else "-" for c in company_name.lower())
-    slug = "-".join(p for p in slug.split("-") if p)[:40]
-
-    run_dir = out_dir / isin / run_date
-    run_dir.mkdir(parents=True, exist_ok=True)
-    typer.echo(f"    {company_name} ({yahoo_ticker}) → {run_dir}")
-
-    # ── 2 & 3. NSM document acquisition (manifest-driven, single session) ────
-    typer.echo("[2/7] Acquiring documents from NSM...")
-    from research_platform.sources.nsm_manifest import AcquiredDocumentSet
-    nsm_service = NSMDownloadService(settings=settings)
-    try:
-        doc_set = nsm_service.acquire_document_set(
-            query=company_name, headed=headed, max_candidates=50,
-        )
-    except NSMSearchError as exc:
-        logger.error("NSM acquisition failed: %s", exc)
-        raise typer.Exit(code=1) from exc
-
-    (run_dir / "nsm_document_set.json").write_text(
-        doc_set.model_dump_json(indent=2), encoding="utf-8"
-    )
-
-    annual_doc = doc_set.get("annual")
-    if not annual_doc or not annual_doc.primary_report_file:
-        logger.error("No annual report acquired from NSM.")
-        raise typer.Exit(code=1)
-    annual_xhtml = Path(annual_doc.primary_report_file)
-    typer.echo(f"    Annual  ({annual_doc.category}): {annual_xhtml.name}")
-
-    post_doc = doc_set.get_post_period()
-    interim_file: Optional[Path] = None
-    if post_doc and post_doc.primary_report_file:
-        interim_file = Path(post_doc.primary_report_file)
-        typer.echo(f"    {post_doc.role.replace('_', ' ').title()} ({post_doc.category}): {interim_file.name}")
-    else:
-        typer.echo("    No post-period document found.")
-    typer.echo(f"    Notes: {'; '.join(doc_set.notes[:3])}")
-
-    # ── 4. Annual report content ──────────────────────────────────────────────
-    typer.echo("[4/7] Extracting annual report content...")
-    extractor = IXBRLExtractor()
-    fsb = IXBRLFactSetBuilder()
-    annual_narrative: Optional[str] = None
-
-    if annual_xhtml.suffix.lower() == ".xhtml":
-        try:
-            fact_set = fsb.build(extractor.extract(annual_xhtml))
-            typer.echo(f"    iXBRL: {len(fact_set.numeric_facts)} numeric, {len(fact_set.narrative_facts)} narrative facts")
-        except IXBRLExtractionError as exc:
-            logger.error("iXBRL extraction failed: %s", exc)
-            raise typer.Exit(code=1) from exc
-    else:
-        # PDF or HTML annual — text extraction, no structured iXBRL
-        from research_platform.documents.ixbrl_summary import IXBRLFactSet as _EmptyFactSet
-        try:
-            annual_narrative = extract_text(annual_xhtml)
-            typer.echo(f"    PDF/HTML text: {len(annual_narrative):,} chars (no iXBRL structure)")
-        except TextExtractionError as exc:
-            logger.warning("Annual text extraction failed (continuing): %s", exc)
-        fact_set = _EmptyFactSet(file_path=str(annual_xhtml))
-
-    # ── 5. Post-period ───────────────────────────────────────────────────────
-    typer.echo("[5/7] Processing post-period update...")
-    post_period_fact_set = None
-    post_period_narrative = None
-
-    if interim_file and interim_file.exists():
-        if interim_file.suffix.lower() == ".xhtml":
-            try:
-                post_period_fact_set = fsb.build(extractor.extract(interim_file))
-                typer.echo(f"    iXBRL: {len(post_period_fact_set.numeric_facts)} facts")
-            except IXBRLExtractionError as exc:
-                logger.warning("Post-period iXBRL extraction failed: %s", exc)
-        else:
-            try:
-                post_period_narrative = extract_text(interim_file)
-                typer.echo(f"    Narrative: {len(post_period_narrative):,} chars")
-            except TextExtractionError as exc:
-                logger.warning("Post-period text extraction failed: %s", exc)
-    else:
-        typer.echo("    No post-period file — staleness flag applied if annual > 9 months.")
-
-    # ── 6. Market data ───────────────────────────────────────────────────────
-    typer.echo(f"[6/7] Fetching market data ({yahoo_ticker})...")
-    market_snapshot: Optional[MarketSnapshot] = None
-    market_history: Optional[FinancialHistory] = None
-    try:
-        market_snapshot, market_history = YFinanceClient().get_snapshot(yahoo_ticker)
-        (run_dir / "market_data.json").write_text(
-            json.dumps({
-                "snapshot": market_snapshot.model_dump(mode="json"),
-                "history": market_history.model_dump(mode="json"),
-            }, indent=2),
-            encoding="utf-8",
-        )
-        typer.echo(
-            f"    {market_snapshot.currency} {market_snapshot.price} | "
-            f"cap {market_snapshot.market_cap:,.0f} | "
-            f"{len(market_history.years)} years history"
-        )
-    except MarketDataError as exc:
-        logger.warning("Market data unavailable (continuing): %s", exc)
-
-    # ── 7. Build packet + run pre-screen ─────────────────────────────────────
-    typer.echo("[7/7] Building packet and running IVF pre-screen...")
-    packet = IVFFIXBRLPacketBuilder().build(
-        fact_set=fact_set,
-        post_period_fact_set=post_period_fact_set,
-        post_period_type="INTERIM_OR_UPDATE",
-        post_period_narrative=post_period_narrative,
-        market_snapshot=market_snapshot,
-        market_history=market_history,
-        company_name=company_name,
-        ticker=yahoo_ticker,
-        isin=isin,
-        annual_narrative=annual_narrative,
-    )
-    packet_dict = packet.model_dump(mode="json")
-    (run_dir / "ivf_packet.json").write_text(json.dumps(packet_dict, indent=2), encoding="utf-8")
-
-    llm_client = create_llm_client(settings)
-    runner = IVFPreScreenRunner(
-        llm_client=llm_client,
-        model=settings.llm_model,
-        temperature=settings.ivf_pre_screen_temperature,
-        max_repair_attempts=settings.ivf_pre_screen_max_repair_attempts,
-    )
-    result = runner.run(
-        packet=packet_dict,
-        prompt_out=run_dir / "prompt.txt",
-        raw_response_out=run_dir / "raw_response.json",
-    )
-    run_payload = runner.build_run_payload(
-        packet=packet_dict,
-        result=result,
-        provider=llm_client.provider_name,
-        model=settings.llm_model,
-    )
-    (run_dir / "ivf_result.json").write_text(
-        json.dumps(run_payload, indent=2), encoding="utf-8"
-    )
-
-    typer.echo(f"\n{'═' * 60}")
-    typer.echo(f"  {result.name}  —  {result.status} / {result.confidence} confidence")
-    typer.echo(f"  {result.one_sentence_summary}")
-    typer.echo(f"  Next: {result.recommended_next_step}")
-    typer.echo(f"  Outputs: {run_dir}")
-    typer.echo(f"{'═' * 60}")
 
 
 @app.command("clean")

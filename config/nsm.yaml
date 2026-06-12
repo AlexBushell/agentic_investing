@@ -27,4 +27,4 @@ nsm_result_org_name_selector: "td[data-before='Disclosing Organisation Name'] su
 nsm_result_category_selector: "td[data-before='Category'] summary"
 nsm_result_link_selector: "td[data-before='Description'] a[href]"
 nsm_download_dialog_selector: "#dialog4"
-nsm_download_button_selector: "#focus4"
+nsm_download_button_selector: "#downloadMenu"

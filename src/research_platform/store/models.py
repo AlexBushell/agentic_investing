@@ -198,6 +198,34 @@ class NarrativeExtract(Base):
     )
 
 
+class DocumentChunk(Base):
+    """Chunked narrative passage for retrieval."""
+
+    __tablename__ = "document_chunks"
+
+    chunk_id: Mapped[uuid.UUID] = _uuid_pk()
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("companies.company_id"), nullable=False, index=True
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("documents.document_id"), nullable=False, index=True
+    )
+    extraction_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("document_extractions.extraction_id"), index=True
+    )
+    narrative_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("narrative_extracts.narrative_id"), index=True
+    )
+    section_name: Mapped[str | None] = mapped_column(String(255))
+    chunk_index: Mapped[int] = mapped_column(nullable=False)
+    chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    char_count: Mapped[int | None]
+    source_confidence: Mapped[str | None] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class MarketSnapshot(Base):
     """Point-in-time market snapshot."""
 

@@ -20,7 +20,7 @@ Its job is **not** to:
 - store framework outputs as part of the company store
 - let one test framework define the core architecture
 
-The current IVF pre-screen work remains useful, but only as a **test consumer**. It should move to `labs/ivf_pre_screen/` and depend on a neutral access layer from the store. If `labs/ivf_pre_screen/` were deleted later, the company data store should continue to make sense and continue to work.
+Analytical frameworks such as the Intrinsic Value Framework pre-screen are external consumers that live in their own repositories and depend on the neutral `access` layer from the store. None of that framework-specific logic lives in this repository.
 
 ## 2. Target Boundary
 
@@ -38,10 +38,8 @@ The current IVF pre-screen work remains useful, but only as a **test consumer**.
 
 ### Out of scope for the store
 
-- IVF packet schemas
-- IVF prompts
-- IVF result schemas
-- IVF orchestration commands as core product paths
+- analytical framework packet/prompt/result schemas
+- analytical framework orchestration commands as core product paths
 - storage of analysis runs, framework results, or prompt artifacts in the core data model
 
 ## 3. Architectural Shape
@@ -64,7 +62,7 @@ Raw sources
   -> gather
   -> store
   -> access
-  -> labs / downstream frameworks
+  -> downstream frameworks (external repos)
 ```
 
 ## 4. Proposed Repository Layout
@@ -82,7 +80,9 @@ src/research_platform/
     logging.py
 
   sources/
-    openfigi.py
+    gleif.py
+    sec_tickers.py
+    edgar.py
     nsm.py
     nsm_manifest.py
     market.py
@@ -109,22 +109,7 @@ src/research_platform/
     dto.py
 ```
 
-### Labs layout
-
-```text
-labs/
-  ivf_pre_screen/
-    README.md
-    runner.py
-    prompt.py
-    schema.py
-    packet_builder.py
-    packet_renderer.py
-```
-
 ## 5. File Moves From The Current Repo
-
-These moves establish the boundary without changing the useful ingestion work:
 
 ### Keep in `src/research_platform/`
 
@@ -133,21 +118,6 @@ These moves establish the boundary without changing the useful ingestion work:
 - most of `documents/`
 - `backup.py`
 - store-related CLI commands
-
-### Move out of `src/` into `labs/ivf_pre_screen/`
-
-- `src/research_platform/frameworks/ivf_pre_screen/schema.py`
-- `src/research_platform/frameworks/ivf_pre_screen/runner.py`
-- `src/research_platform/frameworks/ivf_pre_screen/prompt.py`
-- `src/research_platform/frameworks/ivf_pre_screen/packet_renderer.py`
-- `src/research_platform/documents/ivf_ixbrl_packet.py`
-
-### Remove from core once the move is complete
-
-- `src/research_platform/frameworks/`
-- `config/framework_runner.yaml`
-- framework-specific settings from `core/config.py`
-- `run-ivf-screen`, `build-ivf-packet-from-ixbrl`, and `run-ivf-pre-screen` as first-class store commands
 
 ## 6. Schema V1
 
@@ -363,13 +333,6 @@ The CLI should be re-centered around store operations.
 - `research list-documents --company ...`
 - `research show-document --document-id ...`
 
-### Commands to demote or move to labs
-
-- `research list-frameworks`
-- `research build-ivf-packet-from-ixbrl`
-- `research run-ivf-pre-screen`
-- `research run-ivf-screen`
-
 The backup and restore commands remain valid because they protect the store itself.
 
 ## 9. Refactor Stages
@@ -381,7 +344,6 @@ This should be done in staged increments so the repo stays usable throughout.
 Deliverables:
 - this blueprint
 - README rewrite to describe the repo as a company data store
-- note that `labs/` contains non-core consumers
 
 Success criteria:
 - the repo description is no longer framework-led
@@ -394,34 +356,33 @@ Deliverables:
 - SQLAlchemy models and Alembic setup for schema v1
 
 Success criteria:
-- a company can be registered and stored without involving IVF code
+- a company can be registered and stored without involving any downstream framework code
 
 ### Stage 3: Persist current ingestion outputs
 
 Deliverables:
-- OpenFIGI results stored as company, identifiers, and listings
+- GLEIF (UK) and SEC/EDGAR (US) results stored as company, identifiers, and listings
 - NSM acquisition stored as documents plus document artifacts
 - market fetch stored as market snapshots
 - extraction outputs stored as document extractions, facts, and narratives
 
 Success criteria:
-- the current pipeline can populate the store end-to-end without creating an IVF result
+- the current pipeline can populate the store end-to-end without producing any framework-specific output
 
-### Stage 4: Move IVF to `labs/`
+### Stage 4: Stabilize the access layer as an external contract
 
 Deliverables:
-- IVF modules relocated to `labs/ivf_pre_screen/`
-- IVF consumes `access` interfaces rather than raw core modules
-- framework-specific config removed from the core settings model
+- `access` interfaces documented as the stable integration surface for external framework repos
+- no framework-specific config or modules remain in the core settings model
 
 Success criteria:
-- deleting `labs/ivf_pre_screen/` does not break the store
+- an external framework repo can build company context using only `access`, without touching `sources`, `documents`, or `store` internals
 
 ### Stage 5: Simplify the core CLI
 
 Deliverables:
 - store-first commands promoted
-- IVF entry points removed from core CLI or replaced with lab-specific scripts
+- no framework-specific entry points in the core CLI
 
 Success criteria:
 - a new user can understand the store without reading any framework code
@@ -432,7 +393,9 @@ This is the practical mapping from today's code to the target architecture.
 
 ### Already aligned with the store
 
-- `sources/openfigi.py`
+- `sources/gleif.py`
+- `sources/sec_tickers.py`
+- `sources/edgar.py`
 - `sources/nsm.py`
 - `sources/nsm_manifest.py`
 - `sources/market.py`
@@ -443,25 +406,17 @@ This is the practical mapping from today's code to the target architecture.
 - `documents/xhtml_markdown.py`
 - `backup.py`
 
-### Currently coupled to IVF and should be isolated
-
-- `documents/ivf_ixbrl_packet.py`
-- `frameworks/ivf_pre_screen/*`
-- framework registry loading
-- IVF-specific CLI commands in `cli.py`
-- framework-runner settings in `core/config.py`
-
 ## 11. Key Design Rules
 
 These rules should guide every refactor decision:
 
-1. If a table or module exists only because IVF needs it, it does not belong in the store.
+1. If a table or module exists only because one downstream consumer needs it, it does not belong in the store.
 2. Store provenance-rich company data, not framework judgments.
 3. Separate raw artifacts from extraction outputs.
 4. Make extraction outputs versionable and re-runnable.
 5. Make consumers depend on `access`, not on `sources` or `documents` internals.
 6. Preserve filesystem artifacts for audit and reproducibility, but make the database the registry of truth.
-7. The store must still make sense if `labs/` is deleted entirely.
+7. The store must still make sense if every downstream framework repo is deleted.
 
 ## 12. Immediate Next Actions
 
@@ -471,6 +426,5 @@ Recommended next implementation steps:
 2. Add `store/` and `access/` packages with empty scaffolding and clear module docstrings.
 3. Add schema v1 SQLAlchemy models for `companies`, `identifiers`, `listings`, `documents`, `document_artifacts`, `document_extractions`, `facts`, `narrative_extracts`, `market_snapshots`, and `ingestion_runs`.
 4. Refactor `lookup-isin` and NSM ingestion paths to write to the store.
-5. Move IVF-specific code into `labs/ivf_pre_screen/`.
 
 That sequence preserves momentum while changing the architecture for the right long-term outcome.

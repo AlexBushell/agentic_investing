@@ -1,9 +1,0 @@
-frameworks:
-  IVF_PRE_SCREEN:
-    name: Intrinsic Value Framework Pre-Screen
-    framework_version: v1.0
-    packet_builder: ivf_pre_screen
-    prompt_template: ivf_pre_screen_v1
-    result_schema: IVFPreScreenResult
-    active: true
-

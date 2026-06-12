@@ -53,6 +53,25 @@ class NSMDownloadResult(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class NSMAnnualHistoryYear(BaseModel):
+    year: int
+    selected_candidate: NSMCandidate
+    alternate_candidates: list[NSMCandidate] = Field(default_factory=list)
+
+
+class NSMAnnualHistoryDiscoveryResult(BaseModel):
+    query: str
+    acquired_at: datetime
+    base_url: str
+    result_page_url: Optional[str] = None
+    discovered_candidates: list[NSMCandidate] = Field(default_factory=list)
+    selected_years: list[NSMAnnualHistoryYear] = Field(default_factory=list)
+    missing_years: list[int] = Field(default_factory=list)
+    screenshot_path: Optional[str] = None
+    html_snapshot_path: Optional[str] = None
+    notes: list[str] = Field(default_factory=list)
+
+
 class NSMDownloadService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -172,6 +191,91 @@ class NSMDownloadService:
                     else:
                         result.notes.append("No downloadable candidate link was identified.")
 
+            except PlaywrightTimeoutError as exc:
+                raise NSMSearchError(f"Timed out while interacting with NSM: {exc}") from exc
+            finally:
+                context.close()
+                browser.close()
+
+        return result
+
+    def discover_annual_history(
+        self,
+        *,
+        query: str,
+        years: int = 5,
+        headed: bool = False,
+        browser_channel: Optional[str] = None,
+        max_candidates: int = 50,
+    ) -> NSMAnnualHistoryDiscoveryResult:
+        try:
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise NSMSearchError(
+                "Playwright is not installed. Run 'pip install playwright' and "
+                "'python -m playwright install'."
+            ) from exc
+
+        result = NSMAnnualHistoryDiscoveryResult(
+            query=query,
+            acquired_at=datetime.now(UTC),
+            base_url=self.settings.nsm_base_url,
+        )
+
+        artifact_dir = self._artifact_dir(query)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        channel = browser_channel or self.settings.browser_channel
+
+        _nav_result = NSMDownloadResult(
+            query=query,
+            document_type="annual-history",
+            acquired_at=datetime.now(UTC),
+            base_url=self.settings.nsm_base_url,
+        )
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=not headed, channel=channel)
+            context = browser.new_context(accept_downloads=True)
+            page = context.new_page()
+
+            try:
+                page.goto(self.settings.nsm_base_url, wait_until="domcontentloaded")
+                page.wait_for_load_state("networkidle")
+                self._wait_for_shell(page=page, result=_nav_result)
+                self._dismiss_cookie_banner(page=page, result=_nav_result)
+                self._accept_terms_if_present(page=page, result=_nav_result)
+                self._wait_for_shell(page=page, result=_nav_result)
+                self._wait_for_loading_to_finish(page=page, result=_nav_result)
+
+                broad_request = NSMDownloadRequest(
+                    query=query,
+                    document_type="all",
+                    headed=headed,
+                    browser_channel=browser_channel,
+                    max_results=max_candidates,
+                )
+                self._run_search(page=page, request=broad_request)
+                result.result_page_url = page.url
+
+                all_candidates = self._collect_candidates(
+                    page=page,
+                    max_results=max_candidates,
+                    query=query,
+                    document_type="all",
+                )
+                annual_candidates = self._select_annual_history_candidates(
+                    candidates=all_candidates,
+                    years=years,
+                )
+                result.discovered_candidates = annual_candidates
+                result.selected_years = self._group_annual_candidates_by_year(
+                    annual_candidates,
+                    years=years,
+                )
+                result.missing_years = self._missing_years(result.selected_years, years)
+                self._capture_history_artifacts(page=page, artifact_dir=artifact_dir, result=result)
+                result.notes.extend(_nav_result.notes)
             except PlaywrightTimeoutError as exc:
                 raise NSMSearchError(f"Timed out while interacting with NSM: {exc}") from exc
             finally:
@@ -618,7 +722,7 @@ class NSMDownloadService:
             )
             href_score = NSMDownloadService._candidate_href_score(candidate)
             date_key = NSMDownloadService._parse_candidate_datetime(candidate.date_text)
-            return (org_score, date_key, title_score, href_score + match_score)
+            return (org_score, title_score, href_score + match_score, date_key)
 
         return sorted(candidates, key=score, reverse=True)
 
@@ -655,7 +759,7 @@ class NSMDownloadService:
             return candidates[0] if candidates else None
 
         best_candidate: Optional[NSMCandidate] = None
-        best_score: tuple[datetime, int, int] | None = None
+        best_score: tuple[int, int, datetime] | None = None
 
         for candidate in candidates:
             haystack = " ".join(
@@ -665,12 +769,12 @@ class NSMDownloadService:
                 continue
 
             candidate_score = (
-                NSMDownloadService._parse_candidate_datetime(candidate.date_text),
+                NSMDownloadService._candidate_href_score(candidate),
                 NSMDownloadService._candidate_title_score(
                     candidate=candidate,
                     document_type=normalized_type,
                 ),
-                NSMDownloadService._candidate_href_score(candidate),
+                NSMDownloadService._parse_candidate_datetime(candidate.date_text),
             )
             if best_score is None or candidate_score > best_score:
                 best_candidate = candidate
@@ -762,10 +866,197 @@ class NSMDownloadService:
         dialog = page.locator(self.settings.nsm_download_dialog_selector).first
         dialog.wait_for(state="visible", timeout=15000)
 
-        download_button = page.locator(self.settings.nsm_download_button_selector).first
-        with page.expect_download(timeout=30000) as download_info:
-            download_button.click()
-        download = download_info.value
+        download_button = self._locate_dialog_download_button(page=page, dialog=dialog)
+        try:
+            return self._download_from_dialog_button(
+                page=page,
+                button=download_button,
+                download_dir=download_dir,
+            )
+        except Exception:
+            pass
+
+        try:
+            menu_download = self._download_from_dialog_menu(
+                page=page,
+                dialog=dialog,
+                download_button=download_button,
+                download_dir=download_dir,
+            )
+            if menu_download is not None:
+                return menu_download
+        except Exception:
+            pass
+
+        return self._open_ixbrl_from_dialog(
+            page=page,
+            dialog=dialog,
+            download_dir=download_dir,
+        )
+
+    def _download_from_dialog_button(self, page, button, download_dir: Path) -> Path:
+        with page.expect_download(timeout=5000) as download_info:
+            button.click()
+        return self._save_playwright_download(
+            download=download_info.value,
+            download_dir=download_dir,
+        )
+
+    def _download_from_dialog_menu(
+        self,
+        page,
+        dialog,
+        download_button,
+        download_dir: Path,
+    ) -> Optional[Path]:
+        download_button.click()
+        page.wait_for_timeout(500)
+
+        menu_selectors = [
+            "#downloadMenuList button",
+            "#downloadMenuList a",
+            "[role='menuitem']",
+            ".dropdown-menu button",
+            ".dropdown-menu a",
+            ".dropdown.open .dropdown-menu button",
+            ".dropdown.open .dropdown-menu a",
+            ".open .dropdown-menu button",
+            ".open .dropdown-menu a",
+        ]
+
+        for selector in menu_selectors:
+            menu_items = page.locator(self._visible_selector(selector))
+            count = menu_items.count()
+            for index in range(count):
+                item = menu_items.nth(index)
+                try:
+                    text = " ".join((item.inner_text() or "").split()).lower()
+                except Exception:
+                    text = ""
+                if text and "download" not in text and "save" not in text:
+                    continue
+                try:
+                    with page.expect_download(timeout=10000) as download_info:
+                        item.click()
+                    return self._save_playwright_download(
+                        download=download_info.value,
+                        download_dir=download_dir,
+                    )
+                except Exception:
+                    continue
+
+        return None
+
+    def _open_ixbrl_from_dialog(
+        self,
+        page,
+        dialog,
+        download_dir: Path,
+    ) -> Optional[Path]:
+        open_button = self._locate_dialog_open_button(page=page, dialog=dialog)
+        if open_button is None:
+            return None
+
+        current_url = page.url
+        try:
+            with page.expect_popup(timeout=10000) as popup_info:
+                open_button.click()
+            popup = popup_info.value
+            popup.wait_for_load_state("domcontentloaded")
+            popup.wait_for_load_state("networkidle")
+            target = self._write_dialog_opened_page(
+                opened_page=popup,
+                download_dir=download_dir,
+            )
+            popup.close()
+            return target
+        except Exception:
+            pass
+
+        open_button.click()
+        page.wait_for_load_state("networkidle")
+        if page.url != current_url:
+            return self._write_dialog_opened_page(
+                opened_page=page,
+                download_dir=download_dir,
+            )
+
+        return None
+
+    def _locate_dialog_download_button(self, page, dialog):
+        selectors = [
+            self.settings.nsm_download_button_selector,
+            "#downloadMenu",
+            "button:has-text('Download')",
+            "input[value='Download']",
+            "#OpenOrDownload button",
+            "#OpenOrDownload input[type='button']",
+        ]
+
+        for selector in selectors:
+            if not selector:
+                continue
+
+            for locator in (
+                dialog.locator(self._visible_selector(selector)).first,
+                page.locator(self._visible_selector(selector)).first,
+            ):
+                try:
+                    if locator.count():
+                        locator.wait_for(state="visible", timeout=5000)
+                        locator.scroll_into_view_if_needed()
+                        return locator
+                except Exception:
+                    continue
+
+        raise NSMSearchError("Unable to locate the NSM dialog download control.")
+
+    def _locate_dialog_open_button(self, page, dialog):
+        selectors = [
+            "#focus3",
+            "input[name='openFile']",
+            "input[value='Open']",
+            "button:has-text('View iXBRL')",
+            "input[value='View iXBRL']",
+            "#OpenOrDownload input[type='button']",
+            "#OpenOrDownload button",
+        ]
+
+        for selector in selectors:
+            for locator in (
+                dialog.locator(self._visible_selector(selector)).first,
+                page.locator(self._visible_selector(selector)).first,
+            ):
+                try:
+                    if locator.count():
+                        label = " ".join((locator.inner_text() or "").split()).lower()
+                        value = " ".join((locator.get_attribute("value") or "").split()).lower()
+                        if selector.endswith("button") and "download" in label:
+                            continue
+                        if "download" in label or "download" in value:
+                            continue
+                        locator.wait_for(state="visible", timeout=5000)
+                        locator.scroll_into_view_if_needed()
+                        return locator
+                except Exception:
+                    continue
+
+        return None
+
+    def _write_dialog_opened_page(self, opened_page, download_dir: Path) -> Path:
+        url_path = Path(opened_page.url.split("?")[0])
+        suffix = url_path.suffix.lower()
+        if suffix not in {".xhtml", ".xml", ".html", ".htm"}:
+            suffix = ".xhtml"
+        filename = url_path.name if url_path.name else f"nsm_document{suffix}"
+        if Path(filename).suffix.lower() not in {".xhtml", ".xml", ".html", ".htm"}:
+            filename = f"{Path(filename).stem}{suffix}"
+        target = download_dir / filename
+        target.write_text(opened_page.content(), encoding="utf-8")
+        return target
+
+    @staticmethod
+    def _save_playwright_download(download, download_dir: Path) -> Path:
         suggested_name = download.suggested_filename or "nsm_document.pdf"
         target = download_dir / suggested_name
         download.save_as(target)
@@ -845,6 +1136,19 @@ class NSMDownloadService:
         result.screenshot_path = str(screenshot_path)
         result.html_snapshot_path = str(html_path)
 
+    def _capture_history_artifacts(
+        self,
+        page,
+        artifact_dir: Path,
+        result: NSMAnnualHistoryDiscoveryResult,
+    ) -> None:
+        screenshot_path = artifact_dir / "nsm_history_page.png"
+        html_path = artifact_dir / "nsm_history_page.html"
+        page.screenshot(path=str(screenshot_path), full_page=True)
+        html_path.write_text(page.content(), encoding="utf-8")
+        result.screenshot_path = str(screenshot_path)
+        result.html_snapshot_path = str(html_path)
+
     def _artifact_dir(self, query: str) -> Path:
         return self.settings.nsm_artifact_dir / self._slugify(query)
 
@@ -863,6 +1167,69 @@ class NSMDownloadService:
             "interim-report": "Half-year Financial Report",
         }
         return mapping.get(document_type.strip().lower())
+
+    @staticmethod
+    def _select_annual_history_candidates(
+        candidates: list[NSMCandidate],
+        years: int,
+    ) -> list[NSMCandidate]:
+        annual_candidates = [
+            candidate
+            for candidate in candidates
+            if NSMDownloadService._candidate_title_score(candidate, "annual-report") > 0
+        ]
+
+        def score(candidate: NSMCandidate) -> tuple[datetime, int, int]:
+            return (
+                NSMDownloadService._parse_candidate_datetime(candidate.date_text),
+                NSMDownloadService._candidate_href_score(candidate),
+                NSMDownloadService._candidate_title_score(candidate, "annual-report"),
+            )
+
+        ranked = sorted(annual_candidates, key=score, reverse=True)
+        return ranked[: max(years * 6, years)]
+
+    @staticmethod
+    def _group_annual_candidates_by_year(
+        candidates: list[NSMCandidate],
+        years: int,
+    ) -> list[NSMAnnualHistoryYear]:
+        grouped: dict[int, list[NSMCandidate]] = {}
+        for candidate in candidates:
+            candidate_dt = NSMDownloadService._parse_candidate_datetime(candidate.date_text)
+            if candidate_dt == datetime.min.replace(tzinfo=UTC):
+                continue
+            grouped.setdefault(candidate_dt.year, []).append(candidate)
+
+        selected: list[NSMAnnualHistoryYear] = []
+        for year in sorted(grouped.keys(), reverse=True)[:years]:
+            candidates_for_year = grouped[year]
+            ranked = sorted(
+                candidates_for_year,
+                key=lambda candidate: (
+                    NSMDownloadService._candidate_href_score(candidate),
+                    NSMDownloadService._candidate_title_score(candidate, "annual-report"),
+                    NSMDownloadService._parse_candidate_datetime(candidate.date_text),
+                ),
+                reverse=True,
+            )
+            selected.append(
+                NSMAnnualHistoryYear(
+                    year=year,
+                    selected_candidate=ranked[0],
+                    alternate_candidates=ranked[1:],
+                )
+            )
+        return selected
+
+    @staticmethod
+    def _missing_years(selected_years: list[NSMAnnualHistoryYear], years: int) -> list[int]:
+        if not selected_years:
+            return []
+        latest_year = max(item.year for item in selected_years)
+        expected = {latest_year - offset for offset in range(years)}
+        found = {item.year for item in selected_years}
+        return sorted(expected - found, reverse=True)
 
     @staticmethod
     def _candidate_title_score(candidate: NSMCandidate, document_type: str) -> int:
@@ -909,13 +1276,12 @@ class NSMDownloadService:
     def _candidate_href_score(candidate: NSMCandidate) -> int:
         href = (candidate.href or "").lower()
         if not href:
-            # Null href often means the richer popup/download flow that yields zip/XHTML packages.
-            return 3
+            return 5
         if "/rns/" in href:
             return 0
-        if href.endswith(".pdf"):
-            return 2
         if href.endswith(".zip") or href.endswith(".xhtml") or href.endswith(".xml"):
+            return 4
+        if href.endswith(".pdf"):
             return 3
         if href.endswith(".html") or href.endswith(".htm"):
             return 1
